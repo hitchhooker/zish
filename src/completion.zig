@@ -38,10 +38,24 @@ pub fn handleTabCompletion(self: *Shell) !void {
     // check for git-aware completion
     if (try tryGitCompletion(self, cmd, word_result)) return;
 
-    // check if we're completing a command (first word, no path separators)
-    const is_command_position = word_result.start == 0 and std.mem.indexOf(u8, word, "/") == null;
+    // check if we're completing a command (first word or after pipe/semicolon, no path separators)
+    const is_command_position = blk: {
+        if (std.mem.indexOf(u8, word, "/") != null) break :blk false;
+        if (word_result.start == 0) break :blk true;
+        // check if preceded by | or ; or && or ||
+        var i = word_result.start;
+        while (i > 0 and (cmd[i - 1] == ' ' or cmd[i - 1] == '\t')) i -= 1;
+        if (i > 0 and (cmd[i - 1] == '|' or cmd[i - 1] == ';')) break :blk true;
+        if (i > 1 and cmd[i - 2] == '&' and cmd[i - 1] == '&') break :blk true;
+        break :blk false;
+    };
     if (is_command_position and word.len > 0) {
         if (try tryCommandCompletion(self, word_result)) return;
+    }
+
+    // check for variable completion ($VAR)
+    if (word.len > 0 and word[0] == '$') {
+        if (try tryVariableCompletion(self, word_result)) return;
     }
 
     // determine base directory and search pattern
@@ -115,7 +129,10 @@ pub fn handleTabCompletion(self: *Shell) !void {
 
     const dir = std.fs.cwd().openDir(search_dir, .{ .iterate = true }) catch return;
     var iter = dir.iterate();
+    const show_hidden = pattern.len > 0 and pattern[0] == '.';
     while (try iter.next()) |entry| {
+        // skip dotfiles unless pattern starts with .
+        if (!show_hidden and entry.name.len > 0 and entry.name[0] == '.') continue;
         if (std.mem.startsWith(u8, entry.name, pattern)) {
             var already_exists = false;
             for (existing_args.items) |existing| {
@@ -155,6 +172,10 @@ pub fn handleTabCompletion(self: *Shell) !void {
         const comp_str = match[pattern.len..];
         self.edit_buf.cursor = @intCast(word_end);
         _ = self.edit_buf.insertSlice(comp_str);
+        // add trailing space for files (not directories)
+        if (!std.mem.endsWith(u8, match, "/")) {
+            _ = self.edit_buf.insertSlice(" ");
+        }
         try self.renderLine();
     } else {
         // multiple matches - first try common prefix completion
@@ -195,6 +216,62 @@ pub fn handleTabCompletion(self: *Shell) !void {
     }
 }
 
+fn tryVariableCompletion(self: *Shell, word_result: WordResult) !bool {
+    const word = word_result.word;
+    if (word.len < 1 or word[0] != '$') return false;
+
+    const pattern = word[1..]; // skip the $
+
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
+    defer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
+
+    // get shell variables
+    var var_iter = self.variables.iterator();
+    while (var_iter.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (std.mem.startsWith(u8, name, pattern)) {
+            const full = std.fmt.allocPrint(self.allocator, "${s}", .{name}) catch continue;
+            matches.append(self.allocator, full) catch {
+                self.allocator.free(full);
+                continue;
+            };
+        }
+    }
+
+    if (matches.items.len == 0) return false;
+
+    std.mem.sort([]const u8, matches.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+
+    if (matches.items.len == 1) {
+        const match = matches.items[0];
+        const comp_str = match[word.len..];
+        self.edit_buf.cursor = @intCast(word_result.end);
+        _ = self.edit_buf.insertSlice(comp_str);
+        try self.renderLine();
+        return true;
+    } else {
+        return try showCompletionMatches(self, &matches, word_result, word);
+    }
+}
+
+// must match isBuiltin() in eval.zig
+const builtins = [_][]const u8{
+    "echo",  "cd",      "pwd",      "exit",   "export",   "unset",
+    "alias", "unalias", "source",   ".",      "history",  "type",
+    "which", "set",     "true",     "false",  ":",        "test",
+    "[",     "read",    "printf",   "break",  "continue", "return",
+    "shift", "local",   "declare",  "readonly","jobs",    "fg",
+    "bg",    "kill",    "wait",     "trap",   "eval",     "exec",
+    "builtin","command","hash",     "help",
+};
+
 fn tryCommandCompletion(self: *Shell, word_result: WordResult) !bool {
     const pattern = word_result.word;
 
@@ -204,12 +281,35 @@ fn tryCommandCompletion(self: *Shell, word_result: WordResult) !bool {
         matches.deinit(self.allocator);
     }
 
-    // search PATH directories for matching executables
-    const path_env = std.process.getEnvVarOwned(self.allocator, "PATH") catch return false;
-    defer self.allocator.free(path_env);
-
     var seen = std.StringHashMap(void).init(self.allocator);
     defer seen.deinit();
+
+    // add matching builtins first
+    for (builtins) |builtin| {
+        if (std.mem.startsWith(u8, builtin, pattern)) {
+            const name = self.allocator.dupe(u8, builtin) catch continue;
+            seen.put(name, {}) catch {
+                self.allocator.free(name);
+                continue;
+            };
+            matches.append(self.allocator, name) catch {
+                self.allocator.free(name);
+                continue;
+            };
+        }
+    }
+
+    // search PATH directories for matching executables
+    const path_env = std.process.getEnvVarOwned(self.allocator, "PATH") catch {
+        if (matches.items.len > 0) {
+            return if (matches.items.len == 1)
+                try applySingleCompletion(self, matches.items[0], word_result)
+            else
+                try showCompletionMatches(self, &matches, word_result, pattern);
+        }
+        return false;
+    };
+    defer self.allocator.free(path_env);
 
     var path_iter = std.mem.splitScalar(u8, path_env, ':');
     while (path_iter.next()) |path_dir| {
