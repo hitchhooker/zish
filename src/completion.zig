@@ -38,6 +38,12 @@ pub fn handleTabCompletion(self: *Shell) !void {
     // check for git-aware completion
     if (try tryGitCompletion(self, cmd, word_result)) return;
 
+    // check if we're completing a command (first word, no path separators)
+    const is_command_position = word_result.start == 0 and std.mem.indexOf(u8, word, "/") == null;
+    if (is_command_position and word.len > 0) {
+        if (try tryCommandCompletion(self, word_result)) return;
+    }
+
     // determine base directory and search pattern
     var expanded_dir_buf: [4096]u8 = undefined;
     const search_dir: []const u8 = if (std.mem.lastIndexOf(u8, word, "/")) |last_slash| blk: {
@@ -186,6 +192,68 @@ pub fn handleTabCompletion(self: *Shell) !void {
         self.completion_pattern_len = pattern.len;
 
         try displayCompletions(self);
+    }
+}
+
+fn tryCommandCompletion(self: *Shell, word_result: WordResult) !bool {
+    const pattern = word_result.word;
+
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
+    defer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
+
+    // search PATH directories for matching executables
+    const path_env = std.process.getEnvVarOwned(self.allocator, "PATH") catch return false;
+    defer self.allocator.free(path_env);
+
+    var seen = std.StringHashMap(void).init(self.allocator);
+    defer seen.deinit();
+
+    var path_iter = std.mem.splitScalar(u8, path_env, ':');
+    while (path_iter.next()) |path_dir| {
+        if (path_dir.len == 0) continue;
+
+        const dir = std.fs.cwd().openDir(path_dir, .{ .iterate = true }) catch continue;
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (entry.kind != .file and entry.kind != .sym_link) continue;
+            if (!std.mem.startsWith(u8, entry.name, pattern)) continue;
+            if (seen.contains(entry.name)) continue;
+
+            // check if executable
+            const full_path = std.fs.path.join(self.allocator, &.{ path_dir, entry.name }) catch continue;
+            defer self.allocator.free(full_path);
+
+            const stat = std.fs.cwd().statFile(full_path) catch continue;
+            if (stat.mode & 0o111 == 0) continue;
+
+            const name = self.allocator.dupe(u8, entry.name) catch continue;
+            seen.put(name, {}) catch {
+                self.allocator.free(name);
+                continue;
+            };
+            matches.append(self.allocator, name) catch {
+                self.allocator.free(name);
+                continue;
+            };
+        }
+    }
+
+    if (matches.items.len == 0) return false;
+
+    // sort matches alphabetically
+    std.mem.sort([]const u8, matches.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+
+    if (matches.items.len == 1) {
+        return try applySingleCompletion(self, matches.items[0], word_result);
+    } else {
+        return try showCompletionMatches(self, &matches, word_result, pattern);
     }
 }
 
