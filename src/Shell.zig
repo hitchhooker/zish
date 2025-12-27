@@ -1334,7 +1334,8 @@ fn escapeSequenceAction() !Action {
     const F_SETFL = 4;
     const O_NONBLOCK = 0x800;
 
-    const flags = std.posix.system.fcntl(stdin_fd, F_GETFL, @as(usize, 0));
+    const flags_raw = std.posix.system.fcntl(stdin_fd, F_GETFL, @as(usize, 0));
+    const flags: usize = if (@TypeOf(flags_raw) == c_int) @intCast(flags_raw) else flags_raw;
     _ = std.posix.system.fcntl(stdin_fd, F_SETFL, flags | O_NONBLOCK);
     defer _ = std.posix.system.fcntl(stdin_fd, F_SETFL, flags);
 
