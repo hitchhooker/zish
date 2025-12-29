@@ -676,6 +676,30 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
                     };
                 break :blk oldpwd;
             }
+            // try single arg first, if it fails and we have more args, join them with spaces
+            // this handles paths with spaces like: cd /opt/Mullvad VPN/
+            if (expanded_args.items.len > 2) {
+                // check if single arg exists as directory
+                var dir = std.fs.cwd().openDir(arg, .{}) catch {
+                    // single arg doesn't exist, try joining all args
+                    var total_len: usize = 0;
+                    for (expanded_args.items[1..]) |a| {
+                        total_len += a.len + 1;
+                    }
+                    const joined = try shell.allocator.alloc(u8, total_len - 1);
+                    var pos: usize = 0;
+                    for (expanded_args.items[1..], 0..) |a, i| {
+                        @memcpy(joined[pos..][0..a.len], a);
+                        pos += a.len;
+                        if (i < expanded_args.items.len - 2) {
+                            joined[pos] = ' ';
+                            pos += 1;
+                        }
+                    }
+                    break :blk joined;
+                };
+                dir.close();
+            }
             break :blk try shell.allocator.dupe(u8, arg);
         } else blk: {
             const home = std.process.getEnvVarOwned(shell.allocator, "HOME") catch {
