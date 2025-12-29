@@ -1370,8 +1370,21 @@ fn escapeSequenceAction() !Action {
         '4' => try readTildeSequence(stdin_fd, flags, .{ .move_cursor = .to_line_end }), // End key
         '7' => try readTildeSequence(stdin_fd, flags, .{ .move_cursor = .to_line_start }), // Home key
         '8' => try readTildeSequence(stdin_fd, flags, .{ .move_cursor = .to_line_end }), // End key
+        '?' => { consumeEscapeSequence(stdin_fd); return .none; }, // DA response, consume and ignore
         else => .none,
     };
+}
+
+/// consume remaining bytes of an escape sequence until terminator (letter or ~)
+fn consumeEscapeSequence(stdin_fd: std.posix.fd_t) void {
+    var buf: [1]u8 = undefined;
+    while (true) {
+        const n = std.posix.system.read(stdin_fd, &buf, 1);
+        if (n <= 0) break;
+        const c = buf[0];
+        // escape sequences end with a letter or ~
+        if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or c == '~') break;
+    }
 }
 
 fn readTildeSequence(stdin_fd: std.posix.fd_t, flags: usize, action: Action) !Action {
