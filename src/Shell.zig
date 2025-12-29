@@ -770,6 +770,7 @@ fn handleAction(self: *Shell, action: Action) !void {
 
         .clear_screen => {
             try self.stdout().writeAll("\x1b[2J\x1b[H");
+            try self.stdout().flush();
             self.term_view.finishLine();
             self.displayed_cmd_lines = 1;
             self.terminal_cursor_row = 0;
