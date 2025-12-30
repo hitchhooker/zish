@@ -497,6 +497,16 @@ fn showCompletionMatches(self: *Shell, matches: *std.ArrayList([]const u8), word
 pub fn exitCompletionMode(self: *Shell) void {
     if (!self.completion_mode) return;
 
+    // clear the completion menu if displayed
+    if (self.completion_displayed and self.completion_menu_lines > 0) {
+        // move down past current line, clear menu, move back up
+        self.stdout().writeAll("\x1b[s") catch {}; // save cursor
+        self.stdout().writeByte('\n') catch {};
+        self.stdout().writeAll("\x1b[J") catch {}; // clear to end of screen
+        self.stdout().writeAll("\x1b[u") catch {}; // restore cursor
+        self.stdout().flush() catch {};
+    }
+
     for (self.completion_matches.items) |match| {
         self.allocator.free(match);
     }
@@ -536,6 +546,9 @@ pub fn handleCompletionCycle(self: *Shell, direction: CycleDirection) !void {
 
     try applyCompletion(self, self.completion_pattern_len);
 
+    // render the updated command line first
+    try self.renderLine();
+
     if (self.completion_displayed) {
         try updateCompletionHighlight(self, old_index);
     } else {
@@ -560,6 +573,9 @@ pub fn displayCompletions(self: *Shell) !void {
     const term_width = self.terminal_width;
     const term_height = self.terminal_height;
     const max_menu_height = if (term_height > 3) term_height - 3 else 1;
+
+    // save cursor position before showing menu
+    try self.stdout().writeAll("\x1b[s");
 
     if (term_width < 80) {
         try self.stdout().writeByte('\n');
@@ -596,7 +612,9 @@ pub fn displayCompletions(self: *Shell) !void {
             self.completion_menu_lines = items_to_show;
         }
 
-        try self.renderLine();
+        // restore cursor to command line
+        try self.stdout().writeAll("\x1b[u");
+        try self.stdout().flush();
         self.completion_displayed = true;
         return;
     }
@@ -651,12 +669,17 @@ pub fn displayCompletions(self: *Shell) !void {
         self.completion_menu_lines += 1;
     }
 
-    try self.renderLine();
+    // restore cursor to command line
+    try self.stdout().writeAll("\x1b[u");
+    try self.stdout().flush();
     self.completion_displayed = true;
 }
 
 pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
     const term_width = self.terminal_width;
+
+    // save cursor position on command line
+    try self.stdout().writeAll("\x1b[s");
 
     if (old_index >= self.completion_matches.items.len) {
         const max_item_width: usize = 30;
@@ -673,31 +696,24 @@ pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
         const new_row = self.completion_index / cols;
         const new_col = self.completion_index % cols;
 
-        const lines_up = self.completion_menu_lines + 1;
-        try self.stdout().print("\x1b[{d}A", .{lines_up});
+        // move down to menu, then to the item position
         try self.stdout().print("\x1b[{d}B", .{new_row + 1});
         const new_col_pos = new_col * col_width;
         try self.stdout().print("\x1b[{d}G", .{new_col_pos + 1});
         try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, self.completion_matches.items[self.completion_index], tty.Style.reset });
 
-        const current_row = new_row + 1;
-        const rows_to_bottom = self.completion_menu_lines - current_row;
-        if (rows_to_bottom > 0) {
-            try self.stdout().print("\x1b[{d}B", .{rows_to_bottom});
-        }
-        try self.stdout().print("\x1b[{d}B", .{1});
-
-        try self.stdout().writeAll("\r\x1b[K");
-        try self.renderLine();
+        // restore cursor to command line
+        try self.stdout().writeAll("\x1b[u");
+        try self.stdout().flush();
         return;
     }
 
     if (term_width < 80) {
-        try self.stdout().writeAll("\r");
-        if (self.completion_menu_lines > 0) {
-            try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines});
-        }
+        // narrow terminal - redraw entire menu
+        try self.stdout().writeByte('\n');
         try self.stdout().writeAll("\x1b[J");
+        // don't use save/restore here since displayCompletions does its own
+        try self.stdout().writeAll("\x1b[u"); // restore first
         try displayCompletions(self);
         return;
     }
@@ -718,14 +734,13 @@ pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
     const new_row = self.completion_index / cols;
     const new_col = self.completion_index % cols;
 
-    const lines_up = self.completion_menu_lines + 1;
-    try self.stdout().print("\x1b[{d}A", .{lines_up});
-
+    // move down to old item and un-highlight it
     try self.stdout().print("\x1b[{d}B", .{old_row + 1});
     const old_col_pos = old_col * col_width;
     try self.stdout().print("\x1b[{d}G", .{old_col_pos + 1});
     try self.stdout().print("{s}", .{self.completion_matches.items[old_index]});
 
+    // move to new item and highlight it
     if (new_row > old_row) {
         try self.stdout().print("\x1b[{d}B", .{new_row - old_row});
     } else if (old_row > new_row) {
@@ -735,13 +750,7 @@ pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
     try self.stdout().print("\x1b[{d}G", .{new_col_pos + 1});
     try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, self.completion_matches.items[self.completion_index], tty.Style.reset });
 
-    const current_row = new_row + 1;
-    const rows_to_bottom = self.completion_menu_lines - current_row;
-    if (rows_to_bottom > 0) {
-        try self.stdout().print("\x1b[{d}B", .{rows_to_bottom});
-    }
-    try self.stdout().print("\x1b[{d}B", .{1});
-
-    try self.stdout().writeAll("\r\x1b[K");
-    try self.renderLine();
+    // restore cursor to command line
+    try self.stdout().writeAll("\x1b[u");
+    try self.stdout().flush();
 }
