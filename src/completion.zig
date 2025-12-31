@@ -5,6 +5,7 @@ const tty = @import("tty.zig");
 const git = @import("git.zig");
 const editor = @import("editor.zig");
 const input_mod = @import("input.zig");
+const keywords = @import("keywords.zig");
 
 pub const WordResult = struct {
     word: []const u8,
@@ -261,17 +262,8 @@ fn tryVariableCompletion(self: *Shell, word_result: WordResult) !bool {
     }
 }
 
-// must match isBuiltin() in keywords.zig
-const builtins = [_][]const u8{
-    "echo",    "cd",       "pwd",      "exit",     "export",   "unset",
-    "alias",   "unalias",  "source",   ".",        "history",  "type",
-    "which",   "set",      "true",     "false",    ":",        "test",
-    "[",       "read",     "printf",   "break",    "continue", "return",
-    "shift",   "local",    "declare",  "readonly", "jobs",     "fg",
-    "bg",      "kill",     "wait",     "trap",     "eval",     "exec",
-    "builtin", "command",  "hash",     "help",     "pushd",    "popd",
-    "dirs",    "getopts",  "..",       "...",      "-",        "chpwd",
-};
+// use centralized builtins list from keywords.zig
+const builtins = keywords.shell_builtins;
 
 fn tryCommandCompletion(self: *Shell, word_result: WordResult) !bool {
     const pattern = word_result.word;
