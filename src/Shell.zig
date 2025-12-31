@@ -12,7 +12,6 @@ const input_mod = @import("input.zig");
 const completion_mod = @import("completion.zig");
 const eval = @import("eval.zig");
 const git = @import("git.zig");
-const highlight = @import("highlight.zig");
 const editor = @import("editor.zig");
 const vim = @import("vim.zig");
 
@@ -107,11 +106,6 @@ last_resize_time: i64 = 0,
 stdout_writer: std.fs.File.Writer,
 log_file: ?std.fs.File = null,
 
-// syntax highlighting
-highlighter: highlight.Highlighter,
-highlight_buffer: std.ArrayList(u8),
-enable_highlighting: bool = true,
-
 // PATH lookup cache - maps command name -> full path
 path_cache: std.StringHashMap([]const u8),
 
@@ -168,8 +162,6 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .completion_menu_lines = 0,
         .completion_displayed = false,
         .stdout_writer = .init(.stdout(), writer_buffer),
-        .highlighter = try highlight.Highlighter.init(allocator),
-        .highlight_buffer = try std.ArrayList(u8).initCapacity(allocator, 4096),
         .path_cache = std.StringHashMap([]const u8).init(allocator),
     };
 
@@ -222,10 +214,6 @@ pub fn deinit(self: *Shell) void {
         self.allocator.free(match);
     }
     self.completion_matches.deinit(self.allocator);
-
-    // cleanup highlighter
-    self.highlighter.deinit();
-    self.highlight_buffer.deinit(self.allocator);
 
     // cleanup path cache
     var path_it = self.path_cache.iterator();
