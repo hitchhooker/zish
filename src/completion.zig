@@ -500,10 +500,9 @@ pub fn exitCompletionMode(self: *Shell) void {
     // clear the completion menu if displayed
     if (self.completion_displayed and self.completion_menu_lines > 0) {
         // move down past current line, clear menu, move back up
-        self.stdout().writeAll("\x1b[s") catch {}; // save cursor
         self.stdout().writeByte('\n') catch {};
         self.stdout().writeAll("\x1b[J") catch {}; // clear to end of screen
-        self.stdout().writeAll("\x1b[u") catch {}; // restore cursor
+        self.stdout().print("\x1b[{d}A", .{1}) catch {}; // back up one line
         self.stdout().flush() catch {};
     }
 
@@ -546,12 +545,17 @@ pub fn handleCompletionCycle(self: *Shell, direction: CycleDirection) !void {
 
     try applyCompletion(self, self.completion_pattern_len);
 
-    // render the updated command line first
-    try self.renderLine();
-
     if (self.completion_displayed) {
-        try updateCompletionHighlight(self, old_index);
+        // clear menu, redraw command line, redraw menu
+        try self.stdout().print("\x1b[{d}B", .{self.completion_menu_lines + 1}); // go past menu
+        try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines + 1}); // back to command line
+        try self.stdout().writeAll("\x1b[J"); // clear from here down
+        try self.stdout().flush();
+        self.term_view.last_hash = 0; // force redraw
+        try self.renderLine();
+        try displayCompletions(self);
     } else {
+        try self.renderLine();
         try displayCompletions(self);
     }
 }
@@ -573,9 +577,6 @@ pub fn displayCompletions(self: *Shell) !void {
     const term_width = self.terminal_width;
     const term_height = self.terminal_height;
     const max_menu_height = if (term_height > 3) term_height - 3 else 1;
-
-    // save cursor position before showing menu
-    try self.stdout().writeAll("\x1b[s");
 
     if (term_width < 80) {
         try self.stdout().writeByte('\n');
@@ -612,8 +613,8 @@ pub fn displayCompletions(self: *Shell) !void {
             self.completion_menu_lines = items_to_show;
         }
 
-        // restore cursor to command line
-        try self.stdout().writeAll("\x1b[u");
+        // move cursor back up to command line
+        try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines});
         try self.stdout().flush();
         self.completion_displayed = true;
         return;
@@ -669,8 +670,8 @@ pub fn displayCompletions(self: *Shell) !void {
         self.completion_menu_lines += 1;
     }
 
-    // restore cursor to command line
-    try self.stdout().writeAll("\x1b[u");
+    // move cursor back up to command line
+    try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines});
     try self.stdout().flush();
     self.completion_displayed = true;
 }
