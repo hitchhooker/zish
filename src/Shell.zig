@@ -657,6 +657,11 @@ fn handleAction(self: *Shell, action: Action) !void {
                 // Use new edit_buf for insertion
                 if (!self.edit_buf.insert(char)) return;
 
+                // Update history prefix if in navigation mode
+                if (self.history_index != -1) {
+                    self.history_search_prefix_len = self.edit_buf.len;
+                }
+
                 // Update display (skip during paste mode - redraw at paste end)
                 if (!self.paste_mode) {
                     try self.renderLine();
@@ -672,7 +677,11 @@ fn handleAction(self: *Shell, action: Action) !void {
                 }
             } else {
                 if (self.edit_buf.delete()) {
-                                        try self.renderLine();
+                    // Update history prefix if in navigation mode
+                    if (self.history_index != -1) {
+                        self.history_search_prefix_len = self.edit_buf.len;
+                    }
+                    try self.renderLine();
                 }
             }
         },
@@ -681,7 +690,10 @@ fn handleAction(self: *Shell, action: Action) !void {
             switch (delete_action) {
                 .char_under_cursor => {
                     if (self.edit_buf.deleteForward()) {
-                                                try self.renderLine();
+                        if (self.history_index != -1) {
+                            self.history_search_prefix_len = self.edit_buf.len;
+                        }
+                        try self.renderLine();
                     }
                 },
                 .to_line_end => {
@@ -698,7 +710,10 @@ fn handleAction(self: *Shell, action: Action) !void {
                         self.edit_buf.cursor = start;
                         var i: usize = 0;
                         while (i < len) : (i += 1) _ = self.edit_buf.deleteForward();
-                                                try self.renderLine();
+                        if (self.history_index != -1) {
+                            self.history_search_prefix_len = self.edit_buf.len;
+                        }
+                        try self.renderLine();
                     }
                 },
                 .char_at => |pos| {
@@ -707,7 +722,10 @@ fn handleAction(self: *Shell, action: Action) !void {
                         self.edit_buf.cursor = @intCast(pos);
                         _ = self.edit_buf.deleteForward();
                         self.edit_buf.cursor = if (old_cursor > pos) old_cursor - 1 else old_cursor;
-                                                try self.renderLine();
+                        if (self.history_index != -1) {
+                            self.history_search_prefix_len = self.edit_buf.len;
+                        }
+                        try self.renderLine();
                     }
                 },
             }
