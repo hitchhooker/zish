@@ -1442,8 +1442,8 @@ fn handleExtendedEscapeSequence(stdin_fd: std.posix.fd_t, flags: usize) !Action 
     if (result <= 0) return .none;
 
     return switch (temp_buf[0]) {
-        'C' => .{ .move_cursor = .{ .word_forward = .word } },      // Ctrl+Right
-        'D' => .{ .move_cursor = .{ .word_backward = .word } },     // Ctrl+Left
+        'C' => .{ .move_cursor = .{ .word_forward = .WORD } },      // Ctrl+Right
+        'D' => .{ .move_cursor = .{ .word_backward = .WORD } },     // Ctrl+Left
         'A' => .{ .move_cursor = .to_line_start },                   // Ctrl+Up
         'B' => .{ .move_cursor = .to_line_end },                     // Ctrl+Down
         'H' => .{ .move_cursor = .to_line_start },                   // Ctrl+Home
@@ -1512,15 +1512,13 @@ pub fn enableRawMode(self: *Shell) !void {
     // apply the changes
     std.posix.tcsetattr(stdin_fd, .NOW, termios) catch return;
 
-    // enable bracketed paste mode
-    try self.stdout().writeAll("\x1b[?2004h");
-    try self.stdout().flush();
+    // enable bracketed paste mode (write to stderr to avoid capture by redirects)
+    _ = std.posix.write(std.posix.STDERR_FILENO, "\x1b[?2004h") catch {};
 }
 
 pub fn disableRawMode(self: *Shell) void {
-    // disable bracketed paste mode - must flush to avoid leaking into pipes
-    self.stdout().writeAll("\x1b[?2004l") catch {};
-    self.stdout().flush() catch {};
+    // disable bracketed paste mode (write to stderr to avoid capture by redirects)
+    _ = std.posix.write(std.posix.STDERR_FILENO, "\x1b[?2004l") catch {};
 
     if (self.original_termios) |original| {
         const stdin_fd = std.posix.STDIN_FILENO;
