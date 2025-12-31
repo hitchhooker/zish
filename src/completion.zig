@@ -261,15 +261,16 @@ fn tryVariableCompletion(self: *Shell, word_result: WordResult) !bool {
     }
 }
 
-// must match isBuiltin() in eval.zig
+// must match isBuiltin() in keywords.zig
 const builtins = [_][]const u8{
-    "echo",  "cd",      "pwd",      "exit",   "export",   "unset",
-    "alias", "unalias", "source",   ".",      "history",  "type",
-    "which", "set",     "true",     "false",  ":",        "test",
-    "[",     "read",    "printf",   "break",  "continue", "return",
-    "shift", "local",   "declare",  "readonly","jobs",    "fg",
-    "bg",    "kill",    "wait",     "trap",   "eval",     "exec",
-    "builtin","command","hash",     "help",
+    "echo",    "cd",       "pwd",      "exit",     "export",   "unset",
+    "alias",   "unalias",  "source",   ".",        "history",  "type",
+    "which",   "set",      "true",     "false",    ":",        "test",
+    "[",       "read",     "printf",   "break",    "continue", "return",
+    "shift",   "local",    "declare",  "readonly", "jobs",     "fg",
+    "bg",      "kill",     "wait",     "trap",     "eval",     "exec",
+    "builtin", "command",  "hash",     "help",     "pushd",    "popd",
+    "dirs",    "getopts",  "..",       "...",      "-",        "chpwd",
 };
 
 fn tryCommandCompletion(self: *Shell, word_result: WordResult) !bool {
@@ -546,12 +547,14 @@ pub fn handleCompletionCycle(self: *Shell, direction: CycleDirection) !void {
     try applyCompletion(self, self.completion_pattern_len);
 
     if (self.completion_displayed) {
-        // clear menu, redraw command line, redraw menu
-        try self.stdout().print("\x1b[{d}B", .{self.completion_menu_lines + 1}); // go past menu
-        try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines + 1}); // back to command line
-        try self.stdout().writeAll("\x1b[J"); // clear from here down
+        // clear menu and command line, redraw both
+        // go to start of line, clear everything below
+        try self.stdout().writeAll("\r\x1b[J");
         try self.stdout().flush();
-        self.term_view.last_hash = 0; // force redraw
+        // reset TermView state so it redraws from scratch
+        self.term_view.term.row = 0;
+        self.term_view.term.col = 0;
+        self.term_view.last_hash = 0;
         try self.renderLine();
         try displayCompletions(self);
     } else {
