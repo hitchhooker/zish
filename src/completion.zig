@@ -608,8 +608,8 @@ pub fn displayCompletions(self: *Shell) !void {
             self.completion_menu_lines = items_to_show;
         }
 
-        // move cursor back up to command line
-        try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines});
+        // move cursor back up to command line (+1 for the initial newline before menu)
+        try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines + 1});
         try self.stdout().flush();
         self.completion_displayed = true;
         return;
@@ -665,8 +665,8 @@ pub fn displayCompletions(self: *Shell) !void {
         self.completion_menu_lines += 1;
     }
 
-    // move cursor back up to command line
-    try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines});
+    // move cursor back up to command line (+1 for the initial newline before menu)
+    try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines + 1});
     try self.stdout().flush();
     self.completion_displayed = true;
 }
