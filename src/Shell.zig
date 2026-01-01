@@ -732,11 +732,30 @@ fn handleAction(self: *Shell, action: Action) !void {
                     }
                 }
 
+                // Check for heredoc (need to collect lines until delimiter)
+                if (findHeredocDelimiter(command)) |delim| {
+                    if (!heredocComplete(command, delim)) {
+                        // Need more input - continue editing
+                        _ = self.edit_buf.insert('\n');
+                        try self.stdout().writeByte('\n');
+                        try self.stdout().writeAll("> ");
+                        try self.stdout().flush();
+                        return;
+                    }
+                }
+
                 try self.stdout().writeByte('\n');
                 try self.stdout().flush();
 
                 if (command.len > 0) {
-                    self.last_exit_code = try self.executeCommand(command);
+                    // Preprocess heredoc: convert << DELIM ... DELIM to <<< "content"
+                    const processed_cmd = if (findHeredocDelimiter(command)) |delim|
+                        preprocessHeredoc(self.allocator, command, delim) catch command
+                    else
+                        command;
+                    defer if (processed_cmd.ptr != command.ptr) self.allocator.free(processed_cmd);
+
+                    self.last_exit_code = try self.executeCommand(processed_cmd);
 
                     // Add to history
                     if (self.history) |h| {
@@ -2218,4 +2237,158 @@ fn executeExternal(self: *Shell, command: []const u8) !u8 {
         .Stopped => |sig| @as(u8, @intCast(sig + 128)),
         .Unknown => |code| @as(u8, @intCast(code)),
     };
+}
+
+/// Find heredoc delimiter in command (e.g., << 'EOF' or << EOF or <<EOF)
+fn findHeredocDelimiter(command: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i + 1 < command.len) : (i += 1) {
+        // look for << but not <<<
+        if (command[i] == '<' and command[i + 1] == '<') {
+            if (i + 2 < command.len and command[i + 2] == '<') {
+                i += 2; // skip <<<
+                continue;
+            }
+            // found <<, now parse delimiter
+            var j = i + 2;
+            // skip optional - for <<-
+            if (j < command.len and command[j] == '-') j += 1;
+            // skip whitespace
+            while (j < command.len and (command[j] == ' ' or command[j] == '\t')) : (j += 1) {}
+            if (j >= command.len) return null;
+
+            // check for quoted delimiter
+            const quote = command[j];
+            if (quote == '\'' or quote == '"') {
+                j += 1;
+                const start = j;
+                while (j < command.len and command[j] != quote) : (j += 1) {}
+                if (j > start) return command[start..j];
+            } else {
+                // unquoted delimiter - word until whitespace/newline
+                const start = j;
+                while (j < command.len and command[j] != ' ' and command[j] != '\t' and command[j] != '\n') : (j += 1) {}
+                if (j > start) return command[start..j];
+            }
+        }
+    }
+    return null;
+}
+
+/// Preprocess heredoc: convert "cmd << DELIM\ncontent\nDELIM" to "cmd < /tmp/zish_heredoc_XXXX"
+fn preprocessHeredoc(allocator: std.mem.Allocator, command: []const u8, delimiter: []const u8) ![]const u8 {
+    // Find << position
+    var heredoc_pos: usize = 0;
+    var i: usize = 0;
+    while (i + 1 < command.len) : (i += 1) {
+        if (command[i] == '<' and command[i + 1] == '<') {
+            if (i + 2 < command.len and command[i + 2] == '<') {
+                i += 2;
+                continue;
+            }
+            heredoc_pos = i;
+            break;
+        }
+    }
+
+    // Get part before <<
+    const prefix = command[0..heredoc_pos];
+
+    // Find where heredoc content starts (after newline following delimiter specification)
+    var content_start: usize = heredoc_pos + 2;
+    // skip past the delimiter specification to the newline
+    while (content_start < command.len and command[content_start] != '\n') : (content_start += 1) {}
+    if (content_start < command.len) content_start += 1; // skip the newline
+
+    // Find where content ends (at delimiter line)
+    // Scan line by line from content_start
+    var content_end = content_start;
+    var line_start = content_start;
+    while (line_start < command.len) {
+        // find end of this line
+        var line_end = line_start;
+        while (line_end < command.len and command[line_end] != '\n') : (line_end += 1) {}
+
+        const line = std.mem.trim(u8, command[line_start..line_end], " \t");
+        if (std.mem.eql(u8, line, delimiter)) {
+            // This line is the delimiter - content ends before this line
+            content_end = line_start;
+            // remove trailing newline from content if present
+            if (content_end > content_start and command[content_end - 1] == '\n') {
+                content_end -= 1;
+            }
+            break;
+        }
+
+        // move to next line
+        if (line_end < command.len) {
+            line_start = line_end + 1;
+        } else {
+            break;
+        }
+    }
+
+    // Handle case where no delimiter was found (shouldn't happen if heredocComplete returned true)
+    if (content_end == content_start and content_start < command.len) {
+        content_end = command.len;
+    }
+
+    const content = command[content_start..content_end];
+
+    // Write content to a temp file (use timestamp for uniqueness)
+    const ts = std.time.milliTimestamp();
+    var path_buf: [64]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&path_buf, "/tmp/zish_heredoc_{d}", .{ts}) catch return error.OutOfMemory;
+
+    const file = std.fs.createFileAbsolute(tmp_path, .{ .truncate = true }) catch return error.FileError;
+    defer file.close();
+    file.writeAll(content) catch return error.WriteError;
+    file.writeAll("\n") catch return error.WriteError;
+
+    // Build new command: prefix < /tmp/zish_heredoc_TS
+    const result = try allocator.alloc(u8, prefix.len + 2 + tmp_path.len);
+    @memcpy(result[0..prefix.len], prefix);
+    @memcpy(result[prefix.len..][0..2], "< ");
+    @memcpy(result[prefix.len + 2 ..][0..tmp_path.len], tmp_path);
+
+    return result;
+}
+
+/// Check if heredoc is complete (delimiter found on its own line)
+fn heredocComplete(command: []const u8, delimiter: []const u8) bool {
+    // find where heredoc content starts (after first newline after <<)
+    var found_heredoc = false;
+    var i: usize = 0;
+    while (i + 1 < command.len) : (i += 1) {
+        if (command[i] == '<' and command[i + 1] == '<') {
+            if (i + 2 < command.len and command[i + 2] == '<') {
+                i += 2;
+                continue;
+            }
+            found_heredoc = true;
+            // skip to end of line
+            while (i < command.len and command[i] != '\n') : (i += 1) {}
+            break;
+        }
+    }
+    if (!found_heredoc) return true;
+
+    // now check each line for the delimiter
+    while (i < command.len) {
+        // skip newline
+        if (command[i] == '\n') i += 1;
+        if (i >= command.len) break;
+
+        // get this line
+        const line_start = i;
+        while (i < command.len and command[i] != '\n') : (i += 1) {}
+        const line = command[line_start..i];
+
+        // check if line is exactly the delimiter (trimmed)
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (std.mem.eql(u8, trimmed, delimiter)) {
+            return true;
+        }
+    }
+    return false;
 }
