@@ -8,7 +8,6 @@ pub fn ctrlKey(comptime char_code: u8) u8 {
 
 // Control key constants
 pub const CTRL_C = ctrlKey('c');
-pub const CTRL_T = ctrlKey('t');
 pub const CTRL_L = ctrlKey('l');
 pub const CTRL_D = ctrlKey('d');
 
@@ -86,8 +85,6 @@ pub const VisualModeType = enum {
 };
 
 pub const VimModeAction = union(enum) {
-    toggle_enabled,
-    toggle_mode,
     set_mode: VimMode,
     enter_visual: VisualModeType,
 };
@@ -127,7 +124,6 @@ pub fn insertModeAction(char: u8) Action {
     return switch (char) {
         '\n' => .execute_command,
         CTRL_C => .cancel,
-        CTRL_T => .{ .vim_mode = .toggle_enabled },
         CTRL_L => .clear_screen,
         CTRL_D => .exit_shell,
         CTRL_W => .delete_word_backward,
@@ -181,7 +177,6 @@ pub fn normalModeAction(char: u8) Action {
         '\n' => .execute_command,
 
         CTRL_C => .cancel,
-        CTRL_T => .{ .vim_mode = .toggle_enabled },
 
         else => .none,
     };

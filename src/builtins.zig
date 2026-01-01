@@ -583,8 +583,6 @@ fn set(shell: *Shell, args: []const []const u8) !u8 {
 
     if (std.mem.eql(u8, option, "git_prompt")) {
         shell.show_git_info = enabled;
-    } else if (std.mem.eql(u8, option, "vim")) {
-        shell.vim_mode_enabled = enabled;
     } else {
         try shell.stdout().print("set: unknown option: {s}\n", .{option});
         return 1;

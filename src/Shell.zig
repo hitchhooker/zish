@@ -31,7 +31,6 @@ const CycleDirection = input_mod.CycleDirection;
 
 // Control key constants
 const CTRL_C = input_mod.CTRL_C;
-const CTRL_T = input_mod.CTRL_T;
 const CTRL_L = input_mod.CTRL_L;
 const CTRL_D = input_mod.CTRL_D;
 
@@ -51,7 +50,6 @@ allocator: std.mem.Allocator,
 running: bool,
 history: ?*hist.History,
 vim_mode: VimMode,
-vim_mode_enabled: bool,
 history_index: i32,
 history_search_prefix_len: usize,
 original_termios: ?std.posix.termios = null,
@@ -135,7 +133,6 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .running = false,
         .history = history,
         .vim_mode = .insert,
-        .vim_mode_enabled = true,
         .history_index = -1,
         .history_search_prefix_len = 0,
         .original_termios = null,
@@ -396,10 +393,7 @@ pub fn run(self: *Shell) !void {
     self.terminal_height = initial_size.height;
 
     // set initial cursor style based on vim mode
-    const initial_cursor = if (self.vim_mode_enabled and self.vim_mode == .normal)
-        CursorStyle.block
-    else
-        CursorStyle.bar;
+    const initial_cursor = if (self.vim_mode == .normal) CursorStyle.block else CursorStyle.bar;
     try self.setCursorStyle(initial_cursor);
 
     try self.renderLine();
@@ -550,7 +544,6 @@ fn log(self: *Shell, last_action: Action) !void {
                 "State:\n" ++
                 "\tcursor: {}\n" ++
                 "\tvim_mode: {s}\n" ++
-                "\tvim_mode_enabled: {}\n" ++
                 "\thistory_index: {}\n" ++
                 "\tbuf_len: {}\n" ++
                 "\tsearch_mode: {}\n" ++
@@ -560,7 +553,7 @@ fn log(self: *Shell, last_action: Action) !void {
                 "\tlast_action: '{}'\n",
             .{
                 self.edit_buf.cursor, @tagName(self.vim_mode),
-                self.vim_mode_enabled, self.history_index,
+                self.history_index,
                 self.edit_buf.len,
                 self.search_mode, self.search_len,
                 self.edit_buf.slice(), self.search_buffer[0..self.search_len],
@@ -787,24 +780,13 @@ fn handleAction(self: *Shell, action: Action) !void {
                     self.vi.mode = if (mode == .normal) .normal else .insert;
                     if (mode == .normal) self.paste_mode = false;
                 },
-                .toggle_enabled => {
-                    self.vim_mode_enabled = !self.vim_mode_enabled;
-                },
-                .toggle_mode => {
-                    self.vim_mode = if (self.vim_mode == .normal) .insert else .normal;
-                    self.vi.mode = if (self.vim_mode == .normal) .normal else .insert;
-                    if (self.vim_mode == .normal) self.paste_mode = false;
-                },
                 .enter_visual => |vtype| {
                     self.vi.mode = if (vtype == .line) .visual_line else .visual;
                     self.vi.visual_start = self.edit_buf.cursor;
                 },
             }
             // update cursor style to match vim mode
-            const cursor = if (self.vim_mode_enabled and self.vim_mode == .normal)
-                CursorStyle.block
-            else
-                CursorStyle.bar;
+            const cursor = if (self.vim_mode == .normal) CursorStyle.block else CursorStyle.bar;
             try self.setCursorStyle(cursor);
             // force redraw - prompt changed even if text didn't
             self.term_view.last_hash = 0xDEADBEEF;
@@ -1233,7 +1215,7 @@ fn readNextAction(self: *Shell) !Action {
 
     // In paste mode (and insert mode), buffer content for editing
     // In normal mode, don't capture chars as input even if paste_mode is stuck
-    if (self.paste_mode and (!self.vim_mode_enabled or self.vim_mode == .insert)) {
+    if (self.paste_mode and self.vim_mode == .insert) {
         if (char == CTRL_C) {
             self.paste_mode = false;
             return .cancel;
@@ -1252,26 +1234,22 @@ fn readNextAction(self: *Shell) !Action {
         return self.getSearchModeAction(char);
     }
 
-    // Check if vim mode is enabled
-    if (self.vim_mode_enabled) {
-        return switch (self.vim_mode) {
-            .normal => normalModeAction(char),
-            .insert => insertModeAction(char),
-        };
-    } else {
-        return insertModeAction(char);
-    }
+    // dispatch based on vim mode
+    return switch (self.vim_mode) {
+        .normal => normalModeAction(char),
+        .insert => insertModeAction(char),
+    };
 }
 
 fn insertModeAction(char: u8) Action {
     return switch (char) {
         '\n' => .execute_command,
         CTRL_C => .cancel,
-        CTRL_T => .{ .vim_mode = .toggle_enabled },
         CTRL_L => .clear_screen,
         CTRL_D => .exit_shell,
         '\t' => .tap_complete,
         8, 127 => .backspace,
+        23 => .delete_word_backward, // CTRL_W
         32...126 => .{ .input_char = char },
         else => .none,
     };
@@ -1322,7 +1300,6 @@ fn normalModeAction(char: u8) Action {
         '\n' => .execute_command,
 
         CTRL_C => .cancel,
-        CTRL_T => .{ .vim_mode = .toggle_enabled },
 
         else => .none,
     };
