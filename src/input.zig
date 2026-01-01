@@ -11,7 +11,6 @@ pub const CTRL_C = ctrlKey('c');
 pub const CTRL_T = ctrlKey('t');
 pub const CTRL_L = ctrlKey('l');
 pub const CTRL_D = ctrlKey('d');
-pub const CTRL_B = ctrlKey('b');
 
 // Vim modes
 pub const VimMode = enum {
@@ -117,7 +116,6 @@ pub const Action = union(enum) {
     insert_at_position: InsertAtPosition,
     open_line: OpenLineDirection,
     undo,
-    toggle_bookmark,
     enter_paste_mode,
     exit_paste_mode,
 };
@@ -132,7 +130,6 @@ pub fn insertModeAction(char: u8) Action {
         CTRL_T => .{ .vim_mode = .toggle_enabled },
         CTRL_L => .clear_screen,
         CTRL_D => .exit_shell,
-        CTRL_B => .toggle_bookmark,
         CTRL_W => .delete_word_backward,
         '\t' => .tap_complete,
         8, 127 => .backspace,

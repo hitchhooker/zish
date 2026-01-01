@@ -34,7 +34,6 @@ const CTRL_C = input_mod.CTRL_C;
 const CTRL_T = input_mod.CTRL_T;
 const CTRL_L = input_mod.CTRL_L;
 const CTRL_D = input_mod.CTRL_D;
-const CTRL_B = input_mod.CTRL_B;
 
 // global shell instance for signal handler
 var global_shell: ?*Shell = null;
@@ -599,35 +598,6 @@ fn handleAction(self: *Shell, action: Action) !void {
         .exit_shell => {
             self.running = false;
             try self.stdout().writeByte('\n');
-        },
-
-        .toggle_bookmark => {
-            const h = self.history orelse return;
-
-            if (self.history_index >= 0 and self.history_index < @as(i32, @intCast(h.entries.items.len))) {
-                // Bookmark history entry we're viewing
-                const idx: usize = @intCast(self.history_index);
-                const is_now_bookmarked = !h.isEntryBookmarked(idx);
-                h.toggleBookmark(idx) catch {};
-                // Show indicator and redraw to clear it
-                try self.stdout().writeAll(if (is_now_bookmarked) " *" else " -");
-                try self.stdout().flush();
-                std.Thread.sleep(80 * std.time.ns_per_ms);
-                try self.renderLine();
-            } else if (self.edit_buf.len > 0) {
-                // Bookmark current command being typed
-                const cmd = self.edit_buf.slice();
-                // Add to history and bookmark it
-                h.addCommand(cmd, 0) catch {};
-                const cmd_hash = std.hash.Wyhash.hash(0, cmd);
-                if (h.hash_map.get(cmd_hash)) |idx| {
-                    h.toggleBookmark(idx) catch {};
-                    try self.stdout().writeAll(" *");
-                    try self.stdout().flush();
-                    std.Thread.sleep(80 * std.time.ns_per_ms);
-                    try self.renderLine();
-                }
-            }
         },
 
         .input_char => |char| {
@@ -1300,7 +1270,6 @@ fn insertModeAction(char: u8) Action {
         CTRL_T => .{ .vim_mode = .toggle_enabled },
         CTRL_L => .clear_screen,
         CTRL_D => .exit_shell,
-        CTRL_B => .toggle_bookmark,
         '\t' => .tap_complete,
         8, 127 => .backspace,
         32...126 => .{ .input_char = char },

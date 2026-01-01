@@ -26,14 +26,9 @@ const HistoryEntry = struct {
     flags: u8, // Success flag, etc.
 
     const SUCCESSFUL_FLAG: u8 = 1;
-    const BOOKMARKED_FLAG: u8 = 2;
 
     pub fn isSuccessful(self: HistoryEntry) bool {
         return (self.flags & SUCCESSFUL_FLAG) != 0;
-    }
-
-    pub fn isBookmarked(self: HistoryEntry) bool {
-        return (self.flags & BOOKMARKED_FLAG) != 0;
     }
 };
 
@@ -43,8 +38,6 @@ pub const History = struct {
     string_pool: []u8, // Contiguous string storage for cache efficiency
     string_pool_used: usize,
     hash_map: std.HashMap(u64, u32, std.hash_map.AutoContext(u64), 80), // For O(1) deduplication
-    bookmarks_path: ?[]const u8, // Path to bookmarks file (deprecated, will be removed)
-
     // encrypted persistence
     crypto: *CryptoContext,
     log_writer: LogWriter,
@@ -67,13 +60,6 @@ pub const History = struct {
         errdefer hash_map.deinit();
         try hash_map.ensureTotalCapacity(DEFAULT_CAPACITY);
 
-        // Set up bookmarks path (~/.config/zish/bookmarks)
-        const bookmarks_path = blk: {
-            const home = std.posix.getenv("HOME") orelse break :blk null;
-            const path = std.fmt.allocPrint(allocator, "{s}/.config/zish/bookmarks", .{home}) catch break :blk null;
-            break :blk path;
-        };
-
         // init crypto (allocate on heap so pointer stays valid)
         const crypto = try allocator.create(CryptoContext);
         errdefer allocator.destroy(crypto);
@@ -90,7 +76,6 @@ pub const History = struct {
             .string_pool = string_pool,
             .string_pool_used = 0,
             .hash_map = hash_map,
-            .bookmarks_path = bookmarks_path,
             .crypto = crypto,
             .log_writer = log_writer,
             .dirty = false,
@@ -100,9 +85,6 @@ pub const History = struct {
         history.load() catch |err| {
             std.log.warn("failed to load encrypted history: {}", .{err});
         };
-
-        // load old bookmarks for migration
-        history.loadBookmarks() catch {};
 
         return history;
     }
@@ -119,9 +101,6 @@ pub const History = struct {
         self.hash_map.deinit();
         self.entries.deinit(self.allocator);
         self.allocator.free(self.string_pool);
-        if (self.bookmarks_path) |path| {
-            self.allocator.free(path);
-        }
         self.allocator.destroy(self);
     }
 
@@ -268,90 +247,6 @@ pub const History = struct {
         const start = entry.command_offset;
         const end = start + entry.command_len;
         return self.string_pool[start..end];
-    }
-
-    pub fn toggleBookmark(self: *Self, entry_index: usize) !void {
-        if (entry_index >= self.entries.items.len) return;
-
-        var entry = &self.entries.items[entry_index];
-        entry.flags ^= HistoryEntry.BOOKMARKED_FLAG;
-
-        // Save bookmarks to file
-        try self.saveBookmarks();
-    }
-
-    pub fn isEntryBookmarked(self: *Self, entry_index: usize) bool {
-        if (entry_index >= self.entries.items.len) return false;
-        return self.entries.items[entry_index].isBookmarked();
-    }
-
-    fn loadBookmarks(self: *Self) !void {
-        const path = self.bookmarks_path orelse return;
-
-        const file = std.fs.openFileAbsolute(path, .{}) catch return;
-        defer file.close();
-
-        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch return;
-        defer self.allocator.free(content);
-
-        // Parse bookmarks - each line is a command
-        var lines = std.mem.splitScalar(u8, content, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-
-            // Add command as bookmarked
-            const command_hash = std.hash.Wyhash.hash(0, line);
-
-            // Check if already exists
-            if (self.hash_map.get(command_hash)) |existing_index| {
-                // Mark as bookmarked
-                self.entries.items[existing_index].flags |= HistoryEntry.BOOKMARKED_FLAG;
-            } else {
-                // Add new entry as bookmarked
-                if (self.string_pool_used + line.len > self.string_pool.len) continue;
-
-                const command_offset: u32 = @intCast(self.string_pool_used);
-                @memcpy(self.string_pool[self.string_pool_used..self.string_pool_used + line.len], line);
-                self.string_pool_used += line.len;
-
-                const entry = HistoryEntry{
-                    .command_hash = command_hash,
-                    .command_offset = command_offset,
-                    .command_len = @intCast(line.len),
-                    .frequency = 1,
-                    .timestamp = @intCast(std.time.timestamp()),
-                    .exit_code = 0,
-                    .flags = HistoryEntry.SUCCESSFUL_FLAG | HistoryEntry.BOOKMARKED_FLAG,
-                };
-
-                const entry_index: u32 = @intCast(self.entries.items.len);
-                try self.entries.append(self.allocator, entry);
-                try self.hash_map.put(command_hash, entry_index);
-            }
-        }
-    }
-
-    fn saveBookmarks(self: *Self) !void {
-        const path = self.bookmarks_path orelse return;
-
-        // Ensure directory exists
-        if (std.fs.path.dirname(path)) |dir| {
-            std.fs.makeDirAbsolute(dir) catch |err| {
-                if (err != error.PathAlreadyExists) return err;
-            };
-        }
-
-        const file = try std.fs.createFileAbsolute(path, .{});
-        defer file.close();
-
-        // Write all bookmarked commands
-        for (self.entries.items) |entry| {
-            if (entry.isBookmarked()) {
-                const cmd = self.getCommand(entry);
-                try file.writeAll(cmd);
-                try file.writeAll("\n");
-            }
-        }
     }
 
     pub fn fuzzySearch(self: *Self, query: []const u8, allocator: std.mem.Allocator) ![]FuzzyMatch {
