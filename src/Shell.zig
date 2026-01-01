@@ -674,6 +674,33 @@ fn handleAction(self: *Shell, action: Action) !void {
             }
         },
 
+        .delete_word_backward => {
+            // exit completion mode
+            completion_mod.exitCompletionMode(self);
+
+            // delete word before cursor (like Ctrl+W in bash/zsh)
+            const text = self.edit_buf.slice();
+            var pos = self.edit_buf.cursor;
+
+            // skip whitespace first
+            while (pos > 0 and (text[pos - 1] == ' ' or text[pos - 1] == '\t')) : (pos -= 1) {}
+
+            // then skip non-whitespace (the word)
+            while (pos > 0 and text[pos - 1] != ' ' and text[pos - 1] != '\t') : (pos -= 1) {}
+
+            // delete from pos to cursor
+            const chars_to_delete = self.edit_buf.cursor - pos;
+            var i: usize = 0;
+            while (i < chars_to_delete) : (i += 1) {
+                _ = self.edit_buf.delete();
+            }
+
+            if (self.history_index != -1) {
+                self.history_search_prefix_len = self.edit_buf.len;
+            }
+            try self.renderLine();
+        },
+
         .delete => |delete_action| {
             switch (delete_action) {
                 .char_under_cursor => {

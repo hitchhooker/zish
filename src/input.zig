@@ -104,6 +104,7 @@ pub const Action = union(enum) {
     vim_mode: VimModeAction,
     input_char: u8,
     backspace,
+    delete_word_backward,
     delete: DeleteAction,
     tap_complete,
     cycle_complete: CycleDirection,
@@ -121,6 +122,8 @@ pub const Action = union(enum) {
     exit_paste_mode,
 };
 
+const CTRL_W = 23;
+
 /// Get action for insert mode keypress
 pub fn insertModeAction(char: u8) Action {
     return switch (char) {
@@ -130,6 +133,7 @@ pub fn insertModeAction(char: u8) Action {
         CTRL_L => .clear_screen,
         CTRL_D => .exit_shell,
         CTRL_B => .toggle_bookmark,
+        CTRL_W => .delete_word_backward,
         '\t' => .tap_complete,
         8, 127 => .backspace,
         32...126 => .{ .input_char = char },
