@@ -4,7 +4,7 @@ fast, opinionated shell written in zig. for the brave.
 
 ## features
 
-- vim mode with full text objects
+- hybrid vim/emacs editing (vim text objects + emacs keys + arrows)
 - git prompt (`set git_prompt on`)
 - syntax highlighting
 - tab completion with common prefix
@@ -156,4 +156,4 @@ select text then operate:
 
 ## status
 
-v0.5.1 - daily driver ready, expect rough edges
+v0.7.0 - production ready
