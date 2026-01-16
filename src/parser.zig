@@ -130,9 +130,15 @@ pub const Parser = struct {
             const cmd = try self.parselogicalor();
             try commands.append(self.builder.arena.allocator(), cmd);
 
-            // handle separators
+            // handle separators - require one between commands (like bash)
             if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
                 try self.nextToken();
+            } else {
+                // no separator found - must be at EOF or closing keyword
+                switch (self.current_token.ty) {
+                    .Eof, .Done, .Fi, .Else, .Elif, .Esac, .Then, .RightBrace, .RightParen, .DoubleSemi => {},
+                    else => return error.UnexpectedToken, // syntax error: missing separator
+                }
             }
         }
 
