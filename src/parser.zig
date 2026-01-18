@@ -127,7 +127,19 @@ pub const Parser = struct {
                 return error.TooManyCommands;
             }
 
-            const cmd = try self.parselogicalor();
+            var cmd = try self.parselogicalor();
+
+            // handle & (background) - acts as both modifier AND separator
+            if (self.current_token.ty == .Background) {
+                const line = self.current_token.line;
+                const column = self.current_token.column;
+                try self.nextToken(); // consume &
+                cmd = try self.builder.createbackground(cmd, line, column);
+                // & acts as separator, continue to next command
+                try commands.append(self.builder.arena.allocator(), cmd);
+                continue;
+            }
+
             try commands.append(self.builder.arena.allocator(), cmd);
 
             // handle separators - require one between commands (like bash)
@@ -207,7 +219,7 @@ pub const Parser = struct {
         }
 
         // Create result (pipeline or single command)
-        var result = if (pipeline_commands.items.len == 1)
+        const result = if (pipeline_commands.items.len == 1)
             pipeline_commands.items[0]
         else
             try self.builder.createpipeline(
@@ -216,14 +228,7 @@ pub const Parser = struct {
                 pipeline_commands.items[0].column,
             );
 
-        // Check for background operator (&)
-        if (self.current_token.ty == .Background) {
-            const line = self.current_token.line;
-            const column = self.current_token.column;
-            try self.nextToken(); // consume &
-            result = try self.builder.createbackground(result, line, column);
-        }
-
+        // Note: & is handled in parsecommandlist as it acts as separator
         return result;
     }
 
