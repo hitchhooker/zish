@@ -1473,11 +1473,15 @@ fn getSearchModeAction(self: *Shell, char: u8) Action {
 pub fn enableRawMode(self: *Shell) !void {
     const stdin_fd = std.posix.STDIN_FILENO;
 
-    // get current terminal attributes
-    var termios = std.posix.tcgetattr(stdin_fd) catch return;
-
-    // save original for restoration
-    self.original_termios = termios;
+    // use saved original if available (prevents child processes from
+    // corrupting our terminal state), otherwise read current state
+    var termios = if (self.original_termios) |orig|
+        orig
+    else blk: {
+        const current = std.posix.tcgetattr(stdin_fd) catch return;
+        self.original_termios = current;
+        break :blk current;
+    };
 
     // modify terminal attributes for raw mode
     // disable canonical mode and echo
