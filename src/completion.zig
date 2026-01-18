@@ -28,6 +28,45 @@ pub fn extractWordAtCursor(cmd: []const u8, cursor: usize) ?WordResult {
     return WordResult{ .word = cmd[start..end], .start = start, .end = end };
 }
 
+/// Escape shell special characters in a filename for safe insertion
+fn escapeForShell(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    // characters that need escaping in shell
+    const special = " \t'\"\\()[]{}$&;|<>*?!#~`";
+
+    // count how many escapes needed
+    var escape_count: usize = 0;
+    for (input) |c| {
+        for (special) |s| {
+            if (c == s) {
+                escape_count += 1;
+                break;
+            }
+        }
+    }
+
+    if (escape_count == 0) return allocator.dupe(u8, input);
+
+    // allocate buffer for escaped string
+    const result = try allocator.alloc(u8, input.len + escape_count);
+    var i: usize = 0;
+    for (input) |c| {
+        var needs_escape = false;
+        for (special) |s| {
+            if (c == s) {
+                needs_escape = true;
+                break;
+            }
+        }
+        if (needs_escape) {
+            result[i] = '\\';
+            i += 1;
+        }
+        result[i] = c;
+        i += 1;
+    }
+    return result;
+}
+
 pub fn handleTabCompletion(self: *Shell) !void {
     if (self.edit_buf.len == 0) return;
 
@@ -171,8 +210,11 @@ pub fn handleTabCompletion(self: *Shell) !void {
     } else if (matches.items.len == 1) {
         const match = matches.items[0];
         const comp_str = match[pattern.len..];
+        // escape special characters for shell
+        const escaped = try escapeForShell(self.allocator, comp_str);
+        defer self.allocator.free(escaped);
         self.edit_buf.cursor = @intCast(word_end);
-        _ = self.edit_buf.insertSlice(comp_str);
+        _ = self.edit_buf.insertSlice(escaped);
         // add trailing space for files (not directories)
         if (!std.mem.endsWith(u8, match, "/")) {
             _ = self.edit_buf.insertSlice(" ");
@@ -190,8 +232,11 @@ pub fn handleTabCompletion(self: *Shell) !void {
         if (common_prefix_len > pattern.len) {
             const common_prefix = matches.items[0][0..common_prefix_len];
             const comp_str = common_prefix[pattern.len..];
+            // escape special characters for shell
+            const escaped = try escapeForShell(self.allocator, comp_str);
+            defer self.allocator.free(escaped);
             self.edit_buf.cursor = @intCast(word_end);
-            const inserted = self.edit_buf.insertSlice(comp_str);
+            const inserted = self.edit_buf.insertSlice(escaped);
             if (inserted > 0) {
                 try self.renderLine();
             }
@@ -441,8 +486,12 @@ fn applySingleCompletion(self: *Shell, match: []const u8, word_result: WordResul
     const word_end = word_result.end;
     const comp_str = match[pattern.len..];
 
+    // escape special characters for shell
+    const escaped = try escapeForShell(self.allocator, comp_str);
+    defer self.allocator.free(escaped);
+
     self.edit_buf.cursor = @intCast(word_end);
-    _ = self.edit_buf.insertSlice(comp_str);
+    _ = self.edit_buf.insertSlice(escaped);
     try self.renderLine();
     return true;
 }
@@ -460,8 +509,11 @@ fn showCompletionMatches(self: *Shell, matches: *std.ArrayList([]const u8), word
     if (common_prefix_len > pattern.len) {
         const common_prefix = matches.items[0][0..common_prefix_len];
         const comp_str = common_prefix[pattern.len..];
+        // escape special characters for shell
+        const escaped = try escapeForShell(self.allocator, comp_str);
+        defer self.allocator.free(escaped);
         self.edit_buf.cursor = @intCast(word_result.end);
-        const inserted = self.edit_buf.insertSlice(comp_str);
+        const inserted = self.edit_buf.insertSlice(escaped);
         if (inserted > 0) {
             try self.renderLine();
         }
@@ -561,9 +613,13 @@ fn applyCompletion(self: *Shell, pattern_len: usize) !void {
     const match = self.completion_matches.items[self.completion_index];
     const comp_str = match[pattern_len..];
 
+    // escape special characters for shell
+    const escaped = escapeForShell(self.allocator, comp_str) catch return;
+    defer self.allocator.free(escaped);
+
     self.edit_buf.len = @intCast(self.completion_original_len);
     self.edit_buf.cursor = @intCast(self.completion_word_end);
-    _ = self.edit_buf.insertSlice(comp_str);
+    _ = self.edit_buf.insertSlice(escaped);
 }
 
 pub fn displayCompletions(self: *Shell) !void {
