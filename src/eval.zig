@@ -855,15 +855,29 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     // cleanup pipes and kill already-forked children on error
     errdefer {
+        // close all pipe fds first (children have their own copies via dup2)
         for (pipes) |pipe_fds| {
             if (pipe_fds[0] != -1) std.posix.close(pipe_fds[0]);
             if (pipe_fds[1] != -1) std.posix.close(pipe_fds[1]);
         }
         // kill and reap any children that were already forked
+        // use WNOHANG to avoid blocking forever on stuck children
         for (pids) |pid| {
             if (pid != 0) {
                 std.posix.kill(pid, std.posix.SIG.TERM) catch {};
-                _ = std.posix.waitpid(pid, 0);
+            }
+        }
+        // brief sleep to let children handle SIGTERM
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+        // reap with WNOHANG, escalate to SIGKILL if needed
+        for (pids) |pid| {
+            if (pid != 0) {
+                const result = std.posix.waitpid(pid, std.posix.W.NOHANG);
+                if (result.pid == 0) {
+                    // child still running, force kill
+                    std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+                    _ = std.posix.waitpid(pid, 0);
+                }
             }
         }
     }
