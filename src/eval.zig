@@ -183,11 +183,12 @@ fn hasCommandSubstitution(input: []const u8) bool {
 }
 
 // Expand $VAR references within arithmetic expressions (no allocation)
+// Returns error.BufferTooSmall if result would be truncated
 fn expandArithmeticVars(shell: *Shell, expr: []const u8, dest: *[256]u8) !usize {
     var out_pos: usize = 0;
     var i: usize = 0;
 
-    while (i < expr.len and out_pos < 256) {
+    while (i < expr.len) {
         if (expr[i] == '$' and i + 1 < expr.len) {
             i += 1;
             const name_start = i;
@@ -197,24 +198,27 @@ fn expandArithmeticVars(shell: *Shell, expr: []const u8, dest: *[256]u8) !usize 
             if (i > name_start) {
                 const var_name = expr[name_start..i];
                 if (shell.variables.get(var_name)) |value| {
-                    const copy_len = @min(value.len, 256 - out_pos);
-                    @memcpy(dest[out_pos..][0..copy_len], value[0..copy_len]);
-                    out_pos += copy_len;
+                    if (value.len > 256 - out_pos) return error.BufferTooSmall;
+                    @memcpy(dest[out_pos..][0..value.len], value);
+                    out_pos += value.len;
                 } else if (std.posix.getenv(var_name)) |value| {
-                    const copy_len = @min(value.len, 256 - out_pos);
-                    @memcpy(dest[out_pos..][0..copy_len], value[0..copy_len]);
-                    out_pos += copy_len;
+                    if (value.len > 256 - out_pos) return error.BufferTooSmall;
+                    @memcpy(dest[out_pos..][0..value.len], value);
+                    out_pos += value.len;
                 } else {
                     // Unknown variable = 0 in arithmetic
+                    if (out_pos >= 256) return error.BufferTooSmall;
                     dest[out_pos] = '0';
                     out_pos += 1;
                 }
             } else {
                 // Lone $ - copy it
+                if (out_pos >= 256) return error.BufferTooSmall;
                 dest[out_pos] = '$';
                 out_pos += 1;
             }
         } else {
+            if (out_pos >= 256) return error.BufferTooSmall;
             dest[out_pos] = expr[i];
             out_pos += 1;
             i += 1;
@@ -224,12 +228,13 @@ fn expandArithmeticVars(shell: *Shell, expr: []const u8, dest: *[256]u8) !usize 
 }
 
 // Fast variable expansion that writes to a provided buffer (no allocation)
+// Returns error.BufferTooSmall if result would be truncated - caller should fall back to full expansion
 fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
     // Fast path: no variables
     if (std.mem.indexOfScalar(u8, input, '$') == null) {
-        const len = @min(input.len, 256);
-        @memcpy(dest[0..len], input[0..len]);
-        return len;
+        if (input.len > 256) return error.BufferTooSmall;
+        @memcpy(dest[0..input.len], input);
+        return input.len;
     }
 
     var out_pos: usize = 0;
@@ -280,13 +285,13 @@ fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
                 const var_name = input[name_start..i];
                 // Look up in shell variables first, then env
                 if (shell.variables.get(var_name)) |value| {
-                    const copy_len = @min(value.len, 256 - out_pos);
-                    @memcpy(dest[out_pos..][0..copy_len], value[0..copy_len]);
-                    out_pos += copy_len;
+                    if (value.len > 256 - out_pos) return error.BufferTooSmall;
+                    @memcpy(dest[out_pos..][0..value.len], value);
+                    out_pos += value.len;
                 } else if (std.posix.getenv(var_name)) |value| {
-                    const copy_len = @min(value.len, 256 - out_pos);
-                    @memcpy(dest[out_pos..][0..copy_len], value[0..copy_len]);
-                    out_pos += copy_len;
+                    if (value.len > 256 - out_pos) return error.BufferTooSmall;
+                    @memcpy(dest[out_pos..][0..value.len], value);
+                    out_pos += value.len;
                 }
             } else {
                 // Lone $
@@ -296,11 +301,15 @@ fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
                 }
             }
         } else {
+            if (out_pos >= 256) return error.BufferTooSmall;
             dest[out_pos] = input[i];
             out_pos += 1;
             i += 1;
         }
     }
+
+    // if we exited because buffer full but input remains, that's truncation
+    if (i < input.len) return error.BufferTooSmall;
 
     return out_pos;
 }
@@ -406,12 +415,19 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // Fast path for test builtin - avoid allocations in tight loops
+    // Falls back to normal path if args too large for stack buffers
     if ((raw_cmd.len == 1 and raw_cmd[0] == '[') or std.mem.eql(u8, raw_cmd, "test")) {
-        return evaluateTestBuiltinFast(shell, node);
+        if (evaluateTestBuiltinFast(shell, node)) |result| {
+            return result;
+        } else |err| switch (err) {
+            error.BufferTooSmall => {}, // fall through to normal path
+            else => return err,
+        }
     }
 
     // Fast path for echo builtin - avoid allocations in tight loops
     // Skip fast path if any arg has command substitution $(cmd) (not $((arith)))
+    // Falls back to normal path if args too large for stack buffers
     if (std.mem.eql(u8, raw_cmd, "echo")) {
         var has_cmd_subst = false;
         for (node.children[1..]) |arg_node| {
@@ -421,7 +437,12 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             }
         }
         if (!has_cmd_subst) {
-            return evaluateEchoBuiltinFast(shell, node);
+            if (evaluateEchoBuiltinFast(shell, node)) |result| {
+                return result;
+            } else |err| switch (err) {
+                error.BufferTooSmall => {}, // fall through to normal path
+                else => return err,
+            }
         }
     }
 
