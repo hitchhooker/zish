@@ -28,6 +28,9 @@ pub const shell_keywords = [_][]const u8{
     "while",
 };
 
+/// Standard bash builtin names for syntax highlighting.
+/// NOTE: This includes builtins zish hasn't implemented yet.
+/// For runtime dispatch, use builtins.isBuiltin() instead.
 pub const shell_builtins = [_][]const u8{
     "alias",
     "bg",

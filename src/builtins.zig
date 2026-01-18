@@ -16,18 +16,36 @@ fn ensureDirStack(allocator: std.mem.Allocator) void {
     }
 }
 
+/// Check if name is a builtin that dispatch() handles.
+/// NOTE: This list must match what dispatch() below actually implements.
+/// For syntax highlighting of standard bash builtins, see keywords.shell_builtins instead.
 pub fn isBuiltin(name: []const u8) bool {
-    const builtins = [_][]const u8{
-        "echo",    "cd",       "pwd",      "exit",     "export",   "unset",
-        "alias",   "unalias",  "source",   ".",        "history",  "type",
-        "which",   "set",      "true",     "false",    ":",        "test",
-        "[",       "read",     "printf",   "break",    "continue", "return",
-        "shift",   "local",    "declare",  "readonly", "jobs",     "fg",
-        "bg",      "kill",     "wait",     "trap",     "eval",     "exec",
-        "builtin", "command",  "hash",     "help",     "pushd",    "popd",
-        "dirs",    "getopts",  "..",       "...",      "-",        "chpw",
+    // This list must stay in sync with dispatch() cases below
+    const implemented_builtins = [_][]const u8{
+        // simple returns
+        "true", "false", ":", "continue", "break",
+        // directory
+        "cd", "pwd", "pushd", "popd", "dirs", "..", "...", "-",
+        // io
+        "echo", "printf", "read",
+        // test
+        "test", "[",
+        // variables
+        "export", "unset", "local", "declare", "readonly", "set", "shift", "getopts",
+        // aliases
+        "alias", "unalias",
+        // source/eval/exec
+        "source", ".", "eval", "exec",
+        // info
+        "type", "which", "hash", "history", "help",
+        // job control
+        "jobs", "fg", "bg", "wait", "kill", "trap",
+        // shell control
+        "exit", "return", "builtin", "command",
+        // zish specific (handled in eval.zig)
+        "chpw",
     };
-    for (builtins) |b| {
+    for (implemented_builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;
     }
     return false;
