@@ -295,10 +295,9 @@ fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
                 }
             } else {
                 // Lone $
-                if (out_pos < 256) {
-                    dest[out_pos] = '$';
-                    out_pos += 1;
-                }
+                if (out_pos >= 256) return error.BufferTooSmall;
+                dest[out_pos] = '$';
+                out_pos += 1;
             }
         } else {
             if (out_pos >= 256) return error.BufferTooSmall;
@@ -854,6 +853,10 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // cleanup pipes and kill already-forked children on error
+    // NOTE: if a child is in D-state (uninterruptible sleep, e.g. blocked on
+    // NFS or stuck disk I/O), signals cannot interrupt it and the final
+    // blocking waitpid may hang until the kernel operation completes or fails.
+    // this is a fundamental unix limitation, not solvable in userspace.
     errdefer {
         // close all pipe fds first (children have their own copies via dup2)
         for (pipes) |pipe_fds| {

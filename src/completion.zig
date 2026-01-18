@@ -30,34 +30,35 @@ pub fn extractWordAtCursor(cmd: []const u8, cursor: usize) ?WordResult {
 
 /// Escape shell special characters in a filename for safe insertion
 fn escapeForShell(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-    // characters that need escaping in shell
-    const special = " \t'\"\\()[]{}$&;|<>*?!#~`";
+    // O(1) lookup table for chars needing escape (comptime generated)
+    const escape_table: [256]bool = comptime blk: {
+        var table = [_]bool{false} ** 256;
+        // space, tab, newline, carriage return
+        for (" \t\n\r") |c| table[c] = true;
+        // quotes and backslash
+        for ("'\"\\") |c| table[c] = true;
+        // brackets and braces
+        for ("()[]{}") |c| table[c] = true;
+        // shell operators
+        for ("$&;|<>") |c| table[c] = true;
+        // glob and misc
+        for ("*?!#~`") |c| table[c] = true;
+        break :blk table;
+    };
 
-    // count how many escapes needed
+    // count escapes needed - O(n) with O(1) lookup
     var escape_count: usize = 0;
     for (input) |c| {
-        for (special) |s| {
-            if (c == s) {
-                escape_count += 1;
-                break;
-            }
-        }
+        if (escape_table[c]) escape_count += 1;
     }
 
     if (escape_count == 0) return allocator.dupe(u8, input);
 
-    // allocate buffer for escaped string
+    // allocate and escape
     const result = try allocator.alloc(u8, input.len + escape_count);
     var i: usize = 0;
     for (input) |c| {
-        var needs_escape = false;
-        for (special) |s| {
-            if (c == s) {
-                needs_escape = true;
-                break;
-            }
-        }
-        if (needs_escape) {
+        if (escape_table[c]) {
             result[i] = '\\';
             i += 1;
         }

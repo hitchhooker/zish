@@ -135,23 +135,20 @@ pub const Parser = struct {
                 const column = self.current_token.column;
                 try self.nextToken(); // consume &
                 cmd = try self.builder.createbackground(cmd, line, column);
-                // & acts as separator, continue to next command
-                try commands.append(self.builder.arena.allocator(), cmd);
-                continue;
-            }
-
-            try commands.append(self.builder.arena.allocator(), cmd);
-
-            // handle separators - require one between commands (like bash)
-            if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
+                // & acts as separator, no further separator check needed
+            } else if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
+                // explicit separator
                 try self.nextToken();
             } else {
-                // no separator found - must be at EOF or closing keyword
+                // no separator - must be at EOF or closing keyword
                 switch (self.current_token.ty) {
                     .Eof, .Done, .Fi, .Else, .Elif, .Esac, .Then, .RightBrace, .RightParen, .DoubleSemi => {},
                     else => return error.UnexpectedToken, // syntax error: missing separator
                 }
             }
+
+            // single append point - all paths lead here
+            try commands.append(self.builder.arena.allocator(), cmd);
         }
 
         if (commands.items.len == 0) {
