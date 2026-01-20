@@ -19,7 +19,7 @@ pub const NodeType = enum {
     case_item,  // pattern) body;;
     function_def,
     assignment,
-    redirect, // >, >>, <, 2>, 2>&1, >&2
+    redirect, // >, >>, <, 2>, 2>>, 2>&1, >&2, &>, &>>
     test_expression, // [[ ... ]]
     word,
     string,

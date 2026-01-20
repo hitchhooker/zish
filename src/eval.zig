@@ -1017,10 +1017,26 @@ pub fn evaluateRedirect(shell: *Shell, node: *const ast.AstNode) !u8 {
         const file = try std.fs.cwd().createFile(expanded_target, .{ .truncate = true });
         defer file.close();
         try std.posix.dup2(file.handle, std.posix.STDERR_FILENO);
+    } else if (std.mem.eql(u8, redirect_type, "2>>")) {
+        const file = try std.fs.cwd().createFile(expanded_target, .{ .truncate = false });
+        defer file.close();
+        try file.seekFromEnd(0);
+        try std.posix.dup2(file.handle, std.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "2>&1")) {
         try std.posix.dup2(std.posix.STDOUT_FILENO, std.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, ">&2")) {
         try std.posix.dup2(std.posix.STDERR_FILENO, std.posix.STDOUT_FILENO);
+    } else if (std.mem.eql(u8, redirect_type, "&>")) {
+        const file = try std.fs.cwd().createFile(expanded_target, .{ .truncate = true });
+        defer file.close();
+        try std.posix.dup2(file.handle, std.posix.STDOUT_FILENO);
+        try std.posix.dup2(file.handle, std.posix.STDERR_FILENO);
+    } else if (std.mem.eql(u8, redirect_type, "&>>")) {
+        const file = try std.fs.cwd().createFile(expanded_target, .{ .truncate = false });
+        defer file.close();
+        try file.seekFromEnd(0);
+        try std.posix.dup2(file.handle, std.posix.STDOUT_FILENO);
+        try std.posix.dup2(file.handle, std.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "<<<")) {
         // here string: create pipe, write string, connect to stdin
         const pipe_fds = try std.posix.pipe();

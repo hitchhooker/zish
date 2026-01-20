@@ -25,8 +25,11 @@ pub const TokenType = enum {
     RedirectHereDoc,     // <<<
     RedirectHereDocLiteral, // <<
     RedirectStderr,      // 2>
+    RedirectStderrAppend, // 2>>
     RedirectBoth,        // 2>&1
     RedirectToStderr,    // >&2
+    RedirectAll,         // &>
+    RedirectAllAppend,   // &>>
 
     // grouping
     LeftParen,      // (
@@ -273,6 +276,14 @@ pub const Lexer = struct {
                                 _ = self.advance();
                                 return self.makeTokenValue(.And, "&&");
                             }
+                            if (self.peek() == @as(u8, '>')) {
+                                _ = self.advance(); // >
+                                if (self.peek() == @as(u8, '>')) {
+                                    _ = self.advance(); // second >
+                                    return self.makeTokenValue(.RedirectAllAppend, "&>>");
+                                }
+                                return self.makeTokenValue(.RedirectAll, "&>");
+                            }
                             return self.makeTokenValue(.Background, "&");
                         },
                         ';' => {
@@ -347,16 +358,22 @@ pub const Lexer = struct {
                             return self.makeTokenValue(.RedirectInput, "<");
                         },
                         '0'...'9' => {
-                            // check for fd redirect like 2>
+                            // check for fd redirect like 2> or 2>>
                             if (self.peekN(1) == @as(u8, '>')) {
                                 const fd = ch;
                                 _ = self.advance(); // digit
-                                _ = self.advance(); // >
-                                if (fd == '2' and self.peek() == @as(u8, '&')) {
-                                    if (self.peekN(1) == @as(u8, '1')) {
+                                _ = self.advance(); // first >
+                                if (fd == '2') {
+                                    // check for 2>&1
+                                    if (self.peek() == @as(u8, '&') and self.peekN(1) == @as(u8, '1')) {
                                         _ = self.advance();
                                         _ = self.advance();
                                         return self.makeTokenValue(.RedirectBoth, "2>&1");
+                                    }
+                                    // check for 2>>
+                                    if (self.peek() == @as(u8, '>')) {
+                                        _ = self.advance();
+                                        return self.makeTokenValue(.RedirectStderrAppend, "2>>");
                                     }
                                 }
                                 return self.makeTokenValue(.RedirectStderr, &[_]u8{fd});
