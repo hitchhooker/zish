@@ -362,6 +362,7 @@ pub const Parser = struct {
                 .RedirectInput => "<",
                 .RedirectStderr => "2>",
                 .RedirectBoth => "2>&1",
+                .RedirectToStderr => ">&2",
                 .RedirectHereDoc => "<<<",
                 .RedirectHereDocLiteral => "<<",
                 else => break,
@@ -371,8 +372,8 @@ pub const Parser = struct {
             const column = self.current_token.column;
             try self.nextToken(); // consume redirect token
 
-            // 2>&1 doesn't need a target - it redirects stderr to stdout
-            if (std.mem.eql(u8, redirect_type, "2>&1")) {
+            // fd duplications don't need a target
+            if (std.mem.eql(u8, redirect_type, "2>&1") or std.mem.eql(u8, redirect_type, ">&2")) {
                 // create dummy target node for consistency
                 const target = try self.builder.createword("", line, column);
                 cmd = try self.builder.createredirect(cmd, redirect_type, target, line, column);

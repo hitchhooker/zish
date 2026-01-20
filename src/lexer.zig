@@ -26,6 +26,7 @@ pub const TokenType = enum {
     RedirectHereDocLiteral, // <<
     RedirectStderr,      // 2>
     RedirectBoth,        // 2>&1
+    RedirectToStderr,    // >&2
 
     // grouping
     LeftParen,      // (
@@ -323,6 +324,13 @@ pub const Lexer = struct {
                             if (self.peek() == @as(u8, '>')) {
                                 _ = self.advance();
                                 return self.makeTokenValue(.RedirectAppend, ">>");
+                            }
+                            if (self.peek() == @as(u8, '&')) {
+                                if (self.peekN(1) == @as(u8, '2')) {
+                                    _ = self.advance(); // &
+                                    _ = self.advance(); // 2
+                                    return self.makeTokenValue(.RedirectToStderr, ">&2");
+                                }
                             }
                             return self.makeTokenValue(.RedirectOutput, ">");
                         },
