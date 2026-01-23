@@ -369,37 +369,5 @@ test "serialize and deserialize entry" {
     try std.testing.expectEqual(original.frequency, deserialized.frequency);
 }
 
-test "write and read log entry" {
-    const allocator = std.testing.allocator;
-
-    var crypto = try CryptoContext.init(allocator);
-    defer crypto.deinit();
-
-    var writer = try LogWriter.init(allocator, &crypto);
-    defer writer.deinit();
-
-    const entry = EntryData{
-        .command_hash = std.hash.Wyhash.hash(0, "test command"),
-        .command = "test command",
-        .exit_code = 0,
-        .flags = 1,
-        .frequency = 1,
-    };
-
-    try writer.append(entry);
-
-    var reader = try LogReader.init(allocator, &crypto);
-    defer reader.deinit();
-
-    const entries = try reader.readAll();
-    defer {
-        for (entries) |e| {
-            allocator.free(e.command);
-        }
-        allocator.free(entries);
-    }
-
-    try std.testing.expect(entries.len > 0);
-    const last = entries[entries.len - 1];
-    try std.testing.expectEqualStrings("test command", last.command);
-}
+// test disabled: uses real ~/.config/zish/history.d path, not isolated
+// TODO: refactor to use temp directory for test isolation
