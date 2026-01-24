@@ -39,7 +39,7 @@ pub fn isBuiltin(name: []const u8) bool {
         // info
         "type", "which", "hash", "history", "help",
         // job control
-        "jobs", "fg", "bg", "wait", "kill", "trap",
+        "jobs", "fg", "bg", "wait", "kill", "disown", "trap",
         // shell control
         "exit", "return", "builtin", "command",
         // zish specific (handled in eval.zig)
@@ -107,6 +107,7 @@ pub fn dispatch(shell: *Shell, cmd_name: []const u8, args: []const []const u8) !
     if (std.mem.eql(u8, cmd_name, "bg")) return try bg(shell, args);
     if (std.mem.eql(u8, cmd_name, "wait")) return try wait(shell, args);
     if (std.mem.eql(u8, cmd_name, "kill")) return try kill(shell, args);
+    if (std.mem.eql(u8, cmd_name, "disown")) return try disown(shell, args);
     if (std.mem.eql(u8, cmd_name, "trap")) return try trap(shell, args);
 
     // shell control
@@ -563,8 +564,17 @@ fn readonly(shell: *Shell, args: []const []const u8) !u8 {
 }
 
 fn set(shell: *Shell, args: []const []const u8) !u8 {
+    // no args: show current options
+    if (args.len < 2) {
+        try shell.stdout().print("errexit\t{s}\n", .{if (shell.opt_errexit) "on" else "off"});
+        try shell.stdout().print("nounset\t{s}\n", .{if (shell.opt_nounset) "on" else "off"});
+        try shell.stdout().print("xtrace\t{s}\n", .{if (shell.opt_xtrace) "on" else "off"});
+        try shell.stdout().print("pipefail\t{s}\n", .{if (shell.opt_pipefail) "on" else "off"});
+        return 0;
+    }
+
     // set -- arg1 arg2 ... sets positional parameters
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "--")) {
+    if (std.mem.eql(u8, args[1], "--")) {
         // clear existing positional parameters
         var i: usize = 1;
         while (i <= 99) : (i += 1) {
@@ -588,23 +598,80 @@ fn set(shell: *Shell, args: []const []const u8) !u8 {
         return 0;
     }
 
-    // set option [on|off]
-    if (args.len < 2) {
-        try shell.stdout().writeAll("usage: set <option> [on|off] or set -- args...\n");
-        try shell.stdout().writeAll("options: git_prompt, vim\n");
-        return 0;
+    // process each argument
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+
+        // handle -o option_name / +o option_name
+        if ((arg.len == 2 and arg[0] == '-' and arg[1] == 'o') or
+            (arg.len == 2 and arg[0] == '+' and arg[1] == 'o'))
+        {
+            const enable = arg[0] == '-';
+            i += 1;
+            if (i >= args.len) {
+                try shell.stdout().writeAll("set: -o requires option name\n");
+                return 1;
+            }
+            const opt_name = args[i];
+            if (std.mem.eql(u8, opt_name, "errexit")) {
+                shell.opt_errexit = enable;
+            } else if (std.mem.eql(u8, opt_name, "nounset")) {
+                shell.opt_nounset = enable;
+            } else if (std.mem.eql(u8, opt_name, "xtrace")) {
+                shell.opt_xtrace = enable;
+            } else if (std.mem.eql(u8, opt_name, "pipefail")) {
+                shell.opt_pipefail = enable;
+            } else {
+                try shell.stdout().print("set: unknown option: {s}\n", .{opt_name});
+                return 1;
+            }
+            continue;
+        }
+
+        // handle -euxo / +eux style options
+        if (arg.len >= 2 and (arg[0] == '-' or arg[0] == '+')) {
+            const enable = arg[0] == '-';
+            for (arg[1..]) |c| {
+                switch (c) {
+                    'e' => shell.opt_errexit = enable,
+                    'u' => shell.opt_nounset = enable,
+                    'x' => shell.opt_xtrace = enable,
+                    'o' => {}, // handled above as -o name
+                    else => {
+                        try shell.stdout().print("set: invalid option: -{c}\n", .{c});
+                        return 1;
+                    },
+                }
+            }
+            continue;
+        }
+
+        // legacy style: set option [on|off]
+        const value = if (i + 1 < args.len) args[i + 1] else "on";
+        const enabled = std.mem.eql(u8, value, "on") or std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true");
+
+        if (std.mem.eql(u8, arg, "git_prompt")) {
+            shell.show_git_info = enabled;
+            if (i + 1 < args.len) i += 1;
+        } else if (std.mem.eql(u8, arg, "errexit")) {
+            shell.opt_errexit = enabled;
+            if (i + 1 < args.len) i += 1;
+        } else if (std.mem.eql(u8, arg, "nounset")) {
+            shell.opt_nounset = enabled;
+            if (i + 1 < args.len) i += 1;
+        } else if (std.mem.eql(u8, arg, "xtrace")) {
+            shell.opt_xtrace = enabled;
+            if (i + 1 < args.len) i += 1;
+        } else if (std.mem.eql(u8, arg, "pipefail")) {
+            shell.opt_pipefail = enabled;
+            if (i + 1 < args.len) i += 1;
+        } else {
+            try shell.stdout().print("set: unknown option: {s}\n", .{arg});
+            return 1;
+        }
     }
 
-    const option = args[1];
-    const value = if (args.len > 2) args[2] else "on";
-    const enabled = std.mem.eql(u8, value, "on") or std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true");
-
-    if (std.mem.eql(u8, option, "git_prompt")) {
-        shell.show_git_info = enabled;
-    } else {
-        try shell.stdout().print("set: unknown option: {s}\n", .{option});
-        return 1;
-    }
     return 0;
 }
 
@@ -974,7 +1041,7 @@ fn help(shell: *Shell, args: []const []const u8) !u8 {
         \\  alias, unalias                aliases
         \\  source, eval, exec            execution
         \\  type, hash, history           info
-        \\  jobs, fg, bg, wait, kill      job control
+        \\  jobs, fg, bg, wait, disown    job control
         \\  test, [, true, false          conditionals
         \\  shift, getopts                argument handling
         \\
@@ -985,29 +1052,182 @@ fn help(shell: *Shell, args: []const []const u8) !u8 {
 // ============ job control ============
 
 fn jobs(shell: *Shell, args: []const []const u8) !u8 {
-    _ = args;
-    try shell.stdout().writeAll("jobs: no job control (not implemented)\n");
+    const verbose = args.len > 1 and std.mem.eql(u8, args[1], "-l");
+
+    // Update job statuses first
+    shell.job_table.updateJobStatuses();
+
+    if (shell.job_table.jobs.items.len == 0) {
+        return 0; // no jobs, silent success (like bash)
+    }
+
+    for (shell.job_table.jobs.items) |*job| {
+        try shell.job_table.formatJob(job, shell.stdout(), verbose);
+    }
+
+    // Clean up done jobs after displaying
+    shell.job_table.cleanupDoneJobs();
+
     return 0;
 }
 
 fn fg(shell: *Shell, args: []const []const u8) !u8 {
-    _ = args;
-    try shell.stdout().writeAll("fg: no job control (not implemented)\n");
-    return 1;
+    // Update job statuses
+    shell.job_table.updateJobStatuses();
+
+    var job: ?*@import("jobs.zig").Job = null;
+
+    if (args.len > 1) {
+        // Parse job spec: %1, %+, %-, or just number
+        const spec = args[1];
+        if (spec[0] == '%') {
+            if (spec.len == 1 or spec[1] == '+' or spec[1] == '%') {
+                job = shell.job_table.getCurrentJob();
+            } else if (spec[1] == '-') {
+                if (shell.job_table.previous_job) |id| {
+                    job = shell.job_table.getJob(id);
+                }
+            } else {
+                const job_id = std.fmt.parseInt(u32, spec[1..], 10) catch {
+                    try shell.stdout().print("fg: {s}: no such job\n", .{spec});
+                    return 1;
+                };
+                job = shell.job_table.getJob(job_id);
+            }
+        } else {
+            // Assume it's a job number
+            const job_id = std.fmt.parseInt(u32, spec, 10) catch {
+                try shell.stdout().print("fg: {s}: no such job\n", .{spec});
+                return 1;
+            };
+            job = shell.job_table.getJob(job_id);
+        }
+    } else {
+        // No args: use current job
+        job = shell.job_table.getCurrentJob();
+    }
+
+    if (job == null) {
+        try shell.stdout().writeAll("fg: no current job\n");
+        return 1;
+    }
+
+    const j = job.?;
+    try shell.stdout().print("{s}\n", .{j.command});
+
+    // Disable raw mode before giving terminal to job
+    shell.disableRawMode();
+
+    // Put job in foreground and wait
+    const status = shell.job_table.putJobInForeground(j, j.state == .stopped) catch |err| {
+        try shell.stdout().print("fg: failed to put job in foreground: {}\n", .{err});
+        shell.enableRawMode() catch {};
+        return 1;
+    };
+
+    // Re-enable raw mode
+    shell.enableRawMode() catch {};
+
+    // If job completed, remove it
+    if (j.isCompleted()) {
+        shell.job_table.removeJob(j.id);
+    }
+
+    return @truncate(@as(u32, @bitCast(status)));
 }
 
 fn bg(shell: *Shell, args: []const []const u8) !u8 {
-    _ = args;
-    try shell.stdout().writeAll("bg: no job control (not implemented)\n");
-    return 1;
+    // Update job statuses
+    shell.job_table.updateJobStatuses();
+
+    var job: ?*@import("jobs.zig").Job = null;
+
+    if (args.len > 1) {
+        const spec = args[1];
+        if (spec[0] == '%') {
+            if (spec.len == 1 or spec[1] == '+' or spec[1] == '%') {
+                job = shell.job_table.getCurrentJob();
+            } else if (spec[1] == '-') {
+                if (shell.job_table.previous_job) |id| {
+                    job = shell.job_table.getJob(id);
+                }
+            } else {
+                const job_id = std.fmt.parseInt(u32, spec[1..], 10) catch {
+                    try shell.stdout().print("bg: {s}: no such job\n", .{spec});
+                    return 1;
+                };
+                job = shell.job_table.getJob(job_id);
+            }
+        } else {
+            const job_id = std.fmt.parseInt(u32, spec, 10) catch {
+                try shell.stdout().print("bg: {s}: no such job\n", .{spec});
+                return 1;
+            };
+            job = shell.job_table.getJob(job_id);
+        }
+    } else {
+        job = shell.job_table.getCurrentJob();
+    }
+
+    if (job == null) {
+        try shell.stdout().writeAll("bg: no current job\n");
+        return 1;
+    }
+
+    const j = job.?;
+
+    if (j.state != .stopped) {
+        try shell.stdout().print("bg: job {d} already in background\n", .{j.id});
+        return 0;
+    }
+
+    try shell.stdout().print("[{d}]+ {s} &\n", .{ j.id, j.command });
+
+    // Put job in background and continue it
+    shell.job_table.putJobInBackground(j, true);
+
+    return 0;
 }
 
 fn wait(shell: *Shell, args: []const []const u8) !u8 {
-    _ = args;
-    // wait for any child
-    const result = std.posix.waitpid(-1, 0);
-    if (result.pid > 0) {
-        try shell.stdout().print("[done] {d}\n", .{result.pid});
+    if (args.len > 1) {
+        // Wait for specific job/pid
+        const spec = args[1];
+        var pid: std.posix.pid_t = 0;
+
+        if (spec[0] == '%') {
+            // Job spec
+            const job_id = std.fmt.parseInt(u32, spec[1..], 10) catch {
+                try shell.stdout().print("wait: {s}: no such job\n", .{spec});
+                return 127;
+            };
+            if (shell.job_table.getJob(job_id)) |job| {
+                pid = job.pgid;
+            } else {
+                try shell.stdout().print("wait: {s}: no such job\n", .{spec});
+                return 127;
+            }
+        } else {
+            pid = std.fmt.parseInt(std.posix.pid_t, spec, 10) catch {
+                try shell.stdout().print("wait: {s}: invalid pid\n", .{spec});
+                return 1;
+            };
+        }
+
+        // Wait for specific process/group
+        const result = std.posix.waitpid(pid, 0);
+        if (result.pid > 0) {
+            shell.job_table.markProcessStatus(result.pid, result.status);
+            return @truncate(std.posix.W.EXITSTATUS(result.status));
+        }
+    } else {
+        // Wait for all background jobs
+        while (true) {
+            const result = std.posix.waitpid(-1, 0);
+            if (result.pid <= 0) break;
+            shell.job_table.markProcessStatus(result.pid, result.status);
+        }
+        shell.job_table.cleanupDoneJobs();
     }
     return 0;
 }
@@ -1058,6 +1278,99 @@ fn kill(shell: *Shell, args: []const []const u8) !u8 {
             return 1;
         }
     }
+    return 0;
+}
+
+fn disown(shell: *Shell, args: []const []const u8) !u8 {
+    // disown [-h] [-ar] [jobspec ...]
+    // -h: mark jobs to not receive SIGHUP
+    // -a: remove all jobs
+    // -r: remove only running jobs
+
+    var remove_all = false;
+    var running_only = false;
+    var job_specs_start: usize = 1;
+
+    // Parse flags
+    while (job_specs_start < args.len) {
+        const arg = args[job_specs_start];
+        if (arg.len > 0 and arg[0] == '-') {
+            for (arg[1..]) |c| {
+                switch (c) {
+                    'a' => remove_all = true,
+                    'r' => running_only = true,
+                    'h' => {}, // mark to not receive SIGHUP (no-op for now)
+                    else => {
+                        try shell.stdout().print("disown: invalid option: -{c}\n", .{c});
+                        return 1;
+                    },
+                }
+            }
+            job_specs_start += 1;
+        } else {
+            break;
+        }
+    }
+
+    if (remove_all) {
+        // Remove all jobs (or only running ones if -r)
+        var i: usize = 0;
+        while (i < shell.job_table.jobs.items.len) {
+            const job = &shell.job_table.jobs.items[i];
+            if (!running_only or job.state == .running) {
+                var removed = shell.job_table.jobs.orderedRemove(i);
+                removed.deinit(shell.allocator);
+                // Don't increment i since we removed an item
+            } else {
+                i += 1;
+            }
+        }
+        return 0;
+    }
+
+    // Remove specific jobs
+    if (job_specs_start >= args.len) {
+        // No job spec: remove current job
+        if (shell.job_table.getCurrentJob()) |job| {
+            shell.job_table.removeJob(job.id);
+        } else {
+            try shell.stdout().writeAll("disown: no current job\n");
+            return 1;
+        }
+        return 0;
+    }
+
+    // Process each job spec
+    for (args[job_specs_start..]) |spec| {
+        var job_id: ?u32 = null;
+
+        if (spec[0] == '%') {
+            if (spec.len == 1 or spec[1] == '+' or spec[1] == '%') {
+                if (shell.job_table.getCurrentJob()) |job| {
+                    job_id = job.id;
+                }
+            } else if (spec[1] == '-') {
+                job_id = shell.job_table.previous_job;
+            } else {
+                job_id = std.fmt.parseInt(u32, spec[1..], 10) catch null;
+            }
+        } else {
+            job_id = std.fmt.parseInt(u32, spec, 10) catch null;
+        }
+
+        if (job_id) |id| {
+            if (shell.job_table.getJob(id)) |job| {
+                if (!running_only or job.state == .running) {
+                    shell.job_table.removeJob(id);
+                }
+            } else {
+                try shell.stdout().print("disown: {s}: no such job\n", .{spec});
+            }
+        } else {
+            try shell.stdout().print("disown: {s}: no such job\n", .{spec});
+        }
+    }
+
     return 0;
 }
 

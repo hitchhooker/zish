@@ -12,6 +12,7 @@ const input_mod = @import("input.zig");
 const completion_mod = @import("completion.zig");
 const eval = @import("eval.zig");
 const git = @import("git.zig");
+const jobs = @import("jobs.zig");
 const editor = @import("editor.zig");
 const vim = @import("vim.zig");
 
@@ -33,9 +34,11 @@ const CycleDirection = input_mod.CycleDirection;
 const CTRL_C = input_mod.CTRL_C;
 const CTRL_L = input_mod.CTRL_L;
 const CTRL_D = input_mod.CTRL_D;
+const CTRL_Z = input_mod.CTRL_Z;
 
-// global shell instance for signal handler
-var global_shell: ?*Shell = null;
+// global shell instance for signal handler - must use atomic access
+// to avoid data races between main thread and signal handlers
+var global_shell: @TypeOf(@as(?*Shell, null)) = null;
 
 // ansi color codes for zsh-like colorful prompt
 const Colors = struct {
@@ -55,10 +58,19 @@ history_search_prefix_len: usize,
 original_termios: ?std.posix.termios = null,
 aliases: std.StringHashMap([]const u8),
 variables: std.StringHashMap([]const u8),
+arrays: std.StringHashMap(std.ArrayListUnmanaged([]const u8)), // array variables
 functions: std.StringHashMap(*const ast.AstNode), // name -> body AST
 last_exit_code: u8 = 0,
+
+// shell options (set -e, -u, -x, -o pipefail)
+opt_errexit: bool = false, // -e: exit on error
+opt_nounset: bool = false, // -u: error on undefined variable
+opt_xtrace: bool = false, // -x: print commands before execution
+opt_pipefail: bool = false, // pipefail: pipeline fails if any command fails
 // when true, external commands exec directly instead of fork+exec (for pipeline children)
 in_pipeline: bool = false,
+// job control
+job_table: jobs.JobTable,
 
 // new modular editor
 edit_buf: editor.EditBuffer = .{},
@@ -138,6 +150,7 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .original_termios = null,
         .aliases = std.StringHashMap([]const u8).init(allocator),
         .variables = std.StringHashMap([]const u8).init(allocator),
+        .arrays = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
         .functions = std.StringHashMap(*const ast.AstNode).init(allocator),
         // new modular editor
         .edit_buf = .{},
@@ -159,6 +172,7 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .completion_displayed = false,
         .stdout_writer = .init(.stdout(), writer_buffer),
         .path_cache = std.StringHashMap([]const u8).init(allocator),
+        .job_table = jobs.JobTable.init(allocator),
     };
 
     // don't enable raw mode here - will be enabled by run() for interactive mode
@@ -195,6 +209,17 @@ pub fn deinit(self: *Shell) void {
     }
     self.variables.deinit();
 
+    // cleanup arrays
+    var arr_it = self.arrays.iterator();
+    while (arr_it.next()) |entry| {
+        self.allocator.free(entry.key_ptr.*);
+        for (entry.value_ptr.items) |elem| {
+            self.allocator.free(elem);
+        }
+        entry.value_ptr.deinit(self.allocator);
+    }
+    self.arrays.deinit();
+
     // cleanup functions
     var fn_it = self.functions.iterator();
     while (fn_it.next()) |entry| {
@@ -218,6 +243,9 @@ pub fn deinit(self: *Shell) void {
         self.allocator.free(entry.value_ptr.*);
     }
     self.path_cache.deinit();
+
+    // cleanup job table
+    self.job_table.deinit();
 
     self.allocator.free(self.clipboard);
     self.allocator.free(self.search_buffer);
@@ -387,6 +415,9 @@ pub fn run(self: *Shell) !void {
     // setup signal handler for terminal resize
     self.setupResizeHandler();
 
+    // setup job control signal handlers (ignore SIGTTIN/SIGTTOU)
+    setupJobControlSignals();
+
     // initialize terminal dimensions
     const initial_size = self.getTerminalSize();
     self.terminal_width = initial_size.width;
@@ -401,9 +432,9 @@ pub fn run(self: *Shell) !void {
     var last_action: Action = .none;
 
     while (self.running) {
-        // handle terminal resize
-        if (self.terminal_resized) {
-            self.terminal_resized = false;
+        // handle terminal resize (atomic access - signal handler may set this)
+        if (@atomicLoad(bool, &self.terminal_resized, .acquire)) {
+            @atomicStore(bool, &self.terminal_resized, false, .release);
             try self.handleResize();
         }
 
@@ -464,13 +495,16 @@ fn getTerminalSize(_: *Shell) TerminalSize {
 }
 
 fn handleSigwinch(_: c_int) callconv(.c) void {
-    if (global_shell) |shell| {
-        shell.terminal_resized = true;
+    // atomic load to safely access from signal handler context
+    const shell = @atomicLoad(?*Shell, &global_shell, .acquire);
+    if (shell) |s| {
+        @atomicStore(bool, &s.terminal_resized, true, .release);
     }
 }
 
 fn setupResizeHandler(self: *Shell) void {
-    global_shell = self;
+    // atomic store to safely publish to signal handler
+    @atomicStore(?*Shell, &global_shell, self, .release);
 
     const SIGWINCH = if (@hasDecl(std.posix.SIG, "WINCH")) std.posix.SIG.WINCH else 28;
 
@@ -483,6 +517,23 @@ fn setupResizeHandler(self: *Shell) void {
     };
 
     std.posix.sigaction(SIGWINCH, &act, null);
+}
+
+/// Set up signal handlers for job control
+/// Interactive shells must ignore SIGTTIN/SIGTTOU to avoid being stopped
+/// when terminal control is temporarily given to a child process group
+fn setupJobControlSignals() void {
+    const ignore_action = std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = 0,
+    };
+
+    // Ignore SIGTTIN - sent when bg process reads from terminal
+    std.posix.sigaction(std.posix.SIG.TTIN, &ignore_action, null);
+
+    // Ignore SIGTTOU - sent when bg process writes to terminal
+    std.posix.sigaction(std.posix.SIG.TTOU, &ignore_action, null);
 }
 
 fn handleResize(self: *Shell) !void {
@@ -499,7 +550,7 @@ fn handleResize(self: *Shell) !void {
     const debounce_ms = 50; // wait 50ms between redraws
     if (now - self.last_resize_time < debounce_ms) {
         // schedule another check by keeping the flag set
-        self.terminal_resized = true;
+        @atomicStore(bool, &self.terminal_resized, true, .release);
         return;
     }
     self.last_resize_time = now;
@@ -591,6 +642,33 @@ fn handleAction(self: *Shell, action: Action) !void {
         .exit_shell => {
             self.running = false;
             try self.stdout().writeByte('\n');
+        },
+
+        .suspend_shell => {
+            // suspend the shell with Ctrl+Z
+            try self.stdout().writeAll("^Z\n");
+            try self.stdout().flush();
+
+            // restore terminal to original state before suspending
+            self.disableRawMode();
+
+            // send SIGTSTP to ourselves - we'll be stopped here
+            const pid = std.os.linux.getpid();
+            _ = std.posix.kill(pid, std.posix.SIG.TSTP) catch {};
+
+            // === EXECUTION RESUMES HERE AFTER SIGCONT ===
+            // the parent shell may have changed terminal settings while we
+            // were suspended, so we must re-read the current state rather
+            // than using our cached original_termios
+            self.original_termios = null; // force re-read of terminal state
+            self.enableRawMode() catch {};
+
+            // also update our cached shell terminal modes for job control
+            self.job_table.shell_tmodes = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch self.job_table.shell_tmodes;
+
+            // redraw the prompt
+            try self.stdout().writeAll("\n");
+            try self.renderLine();
         },
 
         .input_char => |char| {
@@ -1266,6 +1344,7 @@ fn insertModeAction(char: u8) Action {
         CTRL_C => .cancel,
         CTRL_L => .clear_screen,
         CTRL_D => .exit_shell,
+        CTRL_Z => .suspend_shell,
         '\t' => .tap_complete,
         8, 127 => .backspace,
         23 => .delete_word_backward, // CTRL_W
@@ -1319,6 +1398,7 @@ fn normalModeAction(char: u8) Action {
         '\n' => .execute_command,
 
         CTRL_C => .cancel,
+        CTRL_Z => .suspend_shell,
 
         else => .none,
     };
@@ -1624,6 +1704,116 @@ pub fn executeCommand(self: *Shell, command: []const u8) !u8 {
     self.last_exit_code = exit_code;
     return exit_code;
 }
+
+// ============ Array operations ============
+
+/// Set array variable (replaces existing)
+pub fn setArray(self: *Shell, name: []const u8, values: []const []const u8) !void {
+    // remove existing array if present
+    if (self.arrays.fetchRemove(name)) |old| {
+        self.allocator.free(old.key);
+        for (old.value.items) |elem| {
+            self.allocator.free(elem);
+        }
+        // need mutable copy to call deinit
+        var arr_copy = old.value;
+        arr_copy.deinit(self.allocator);
+    }
+
+    // also remove from scalar variables (array shadows scalar)
+    if (self.variables.fetchRemove(name)) |old| {
+        self.allocator.free(old.key);
+        self.allocator.free(old.value);
+    }
+
+    const name_copy = try self.allocator.dupe(u8, name);
+    errdefer self.allocator.free(name_copy);
+
+    var arr = std.ArrayListUnmanaged([]const u8){};
+    errdefer {
+        for (arr.items) |elem| self.allocator.free(elem);
+        arr.deinit(self.allocator);
+    }
+
+    for (values) |val| {
+        try arr.append(self.allocator, try self.allocator.dupe(u8, val));
+    }
+
+    try self.arrays.put(name_copy, arr);
+}
+
+/// Get array element by index
+pub fn getArrayElement(self: *Shell, name: []const u8, index: usize) ?[]const u8 {
+    if (self.arrays.get(name)) |arr| {
+        if (index < arr.items.len) {
+            return arr.items[index];
+        }
+    }
+    return null;
+}
+
+/// Get all array elements (for ${arr[@]} or ${arr[*]})
+pub fn getArrayAll(self: *Shell, name: []const u8) ?[]const []const u8 {
+    if (self.arrays.get(name)) |arr| {
+        return arr.items;
+    }
+    return null;
+}
+
+/// Get array length (for ${#arr[@]})
+pub fn getArrayLen(self: *Shell, name: []const u8) ?usize {
+    if (self.arrays.get(name)) |arr| {
+        return arr.items.len;
+    }
+    return null;
+}
+
+/// Set single array element
+pub fn setArrayElement(self: *Shell, name: []const u8, index: usize, value: []const u8) !void {
+    const arr_ptr = self.arrays.getPtr(name) orelse {
+        // create new array with this element
+        var arr = std.ArrayListUnmanaged([]const u8){};
+        errdefer {
+            for (arr.items) |elem| self.allocator.free(elem);
+            arr.deinit(self.allocator);
+        }
+
+        // extend to index with empty strings, then set the target element
+        while (arr.items.len < index) {
+            try arr.append(self.allocator, try self.allocator.dupe(u8, ""));
+        }
+        // append the actual value at index (not overwriting)
+        try arr.append(self.allocator, try self.allocator.dupe(u8, value));
+
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+
+        try self.arrays.put(name_copy, arr);
+        return;
+    };
+
+    // extend array if needed
+    while (arr_ptr.items.len <= index) {
+        try arr_ptr.append(self.allocator, try self.allocator.dupe(u8, ""));
+    }
+
+    // free old value and set new
+    self.allocator.free(arr_ptr.items[index]);
+    arr_ptr.items[index] = try self.allocator.dupe(u8, value);
+}
+
+/// Append to array (for arr+=(values))
+pub fn appendArray(self: *Shell, name: []const u8, values: []const []const u8) !void {
+    const arr_ptr = self.arrays.getPtr(name) orelse {
+        // create new array
+        return self.setArray(name, values);
+    };
+
+    for (values) |val| {
+        try arr_ptr.append(self.allocator, try self.allocator.dupe(u8, val));
+    }
+}
+
 /// Result of variable expansion - either borrowed (no alloc) or owned (needs free)
 pub const ExpandResult = struct {
     slice: []const u8,
@@ -1786,7 +1976,7 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
             if (i < input.len and input[i] == '{') {
                 i += 1; // skip {
 
-                // Check for ${#VAR} length expansion
+                // Check for ${#VAR} or ${#arr[@]} length expansion
                 if (i < input.len and input[i] == '#') {
                     i += 1; // skip #
                     const name_start = i;
@@ -1796,14 +1986,33 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                     const var_name = input[name_start..i];
                     if (i < input.len and input[i] == '}') i += 1;
 
-                    // Get variable value and compute length
                     var var_len: usize = 0;
-                    if (self.variables.get(var_name)) |value| {
-                        var_len = value.len;
-                    } else if (std.process.getEnvVarOwned(self.allocator, var_name)) |val| {
-                        var_len = val.len;
-                        self.allocator.free(val);
-                    } else |_| {}
+
+                    // check for array length: ${#arr[@]} or ${#arr[*]}
+                    if (std.mem.endsWith(u8, var_name, "[@]") or std.mem.endsWith(u8, var_name, "[*]")) {
+                        const arr_name = var_name[0 .. var_name.len - 3];
+                        if (self.getArrayLen(arr_name)) |len| {
+                            var_len = len;
+                        }
+                    } else if (std.mem.indexOfScalar(u8, var_name, '[')) |bracket_pos| {
+                        // ${#arr[n]} - length of element
+                        const arr_name = var_name[0..bracket_pos];
+                        if (std.mem.indexOfScalar(u8, var_name[bracket_pos..], ']')) |close_offset| {
+                            const index_str = var_name[bracket_pos + 1 .. bracket_pos + close_offset];
+                            const idx = std.fmt.parseInt(usize, index_str, 10) catch 0;
+                            if (self.getArrayElement(arr_name, idx)) |elem| {
+                                var_len = elem.len;
+                            }
+                        }
+                    } else {
+                        // regular variable length
+                        if (self.variables.get(var_name)) |value| {
+                            var_len = value.len;
+                        } else if (std.process.getEnvVarOwned(self.allocator, var_name)) |val| {
+                            var_len = val.len;
+                            self.allocator.free(val);
+                        } else |_| {}
+                    }
 
                     var len_buf: [20]u8 = undefined;
                     const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{var_len}) catch "0";
@@ -1814,95 +2023,227 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                 const name_start = i;
 
                 // Find end of variable name or modifier
-                while (i < input.len and input[i] != '}' and input[i] != ':' and input[i] != '-' and input[i] != '+' and input[i] != '?') {
+                // Stop at: } : - + ? # % /
+                while (i < input.len and input[i] != '}' and input[i] != ':' and
+                    input[i] != '-' and input[i] != '+' and input[i] != '?' and
+                    input[i] != '#' and input[i] != '%' and input[i] != '/')
+                {
                     i += 1;
                 }
 
                 const var_name = input[name_start..i];
 
-                // Check for modifier
-                var modifier: u8 = 0;
-                var has_colon = false;
-                var default_value: []const u8 = "";
-
-                if (i < input.len and input[i] == ':') {
-                    has_colon = true;
-                    i += 1;
-                }
-
-                if (i < input.len and (input[i] == '-' or input[i] == '+' or input[i] == '?')) {
-                    modifier = input[i];
-                    i += 1;
-
-                    // Find the default/alternate value up to closing }
-                    const val_start = i;
-                    var brace_depth: u32 = 1;
-                    while (i < input.len and brace_depth > 0) {
-                        if (input[i] == '{') brace_depth += 1;
-                        if (input[i] == '}') brace_depth -= 1;
-                        if (brace_depth > 0) i += 1;
-                    }
-                    default_value = input[val_start..i];
-                }
-
-                // Skip closing }
-                if (i < input.len and input[i] == '}') i += 1;
-
-                // Look up variable value
+                // Look up variable value first (needed for all modifiers)
                 var var_value: ?[]const u8 = null;
                 var owned_value: ?[]const u8 = null;
                 defer if (owned_value) |v| self.allocator.free(v);
 
-                if (self.variables.get(var_name)) |value| {
-                    var_value = value;
+                // check for array expansion: ${arr[@]} or ${arr[*]} or ${arr[n]}
+                if (std.mem.endsWith(u8, var_name, "[@]") or std.mem.endsWith(u8, var_name, "[*]")) {
+                    // expand all array elements
+                    const arr_name = var_name[0 .. var_name.len - 3];
+                    if (self.getArrayAll(arr_name)) |elements| {
+                        // skip to closing brace
+                        while (i < input.len and input[i] != '}') i += 1;
+                        if (i < input.len and input[i] == '}') i += 1;
+
+                        // join elements with spaces
+                        for (elements, 0..) |elem, idx| {
+                            if (idx > 0) try result.append(self.allocator, ' ');
+                            try result.appendSlice(self.allocator, elem);
+                        }
+                        continue;
+                    }
+                } else if (std.mem.indexOfScalar(u8, var_name, '[')) |bracket_pos| {
+                    // array element: ${arr[n]}
+                    const arr_name = var_name[0..bracket_pos];
+                    if (std.mem.indexOfScalar(u8, var_name[bracket_pos..], ']')) |close_offset| {
+                        const index_str = var_name[bracket_pos + 1 .. bracket_pos + close_offset];
+                        const idx = std.fmt.parseInt(usize, index_str, 10) catch 0;
+                        if (self.getArrayElement(arr_name, idx)) |elem| {
+                            var_value = elem;
+                        }
+                    }
                 } else {
-                    const env_value = std.process.getEnvVarOwned(self.allocator, var_name) catch null;
-                    if (env_value) |val| {
-                        owned_value = val;
-                        var_value = val;
+                    // regular scalar variable
+                    if (self.variables.get(var_name)) |value| {
+                        var_value = value;
+                    } else {
+                        const env_value = std.process.getEnvVarOwned(self.allocator, var_name) catch null;
+                        if (env_value) |val| {
+                            owned_value = val;
+                            var_value = val;
+                        }
                     }
                 }
 
-                // Apply modifier
-                const is_set = var_value != null;
-                const is_empty = if (var_value) |v| v.len == 0 else true;
-                const use_default = if (has_colon) !is_set or is_empty else !is_set;
+                // Handle different modifiers
+                if (i < input.len and input[i] == '#') {
+                    // ${VAR#pattern} or ${VAR##pattern} - remove prefix
+                    i += 1;
+                    const greedy = i < input.len and input[i] == '#';
+                    if (greedy) i += 1;
 
-                switch (modifier) {
-                    '-' => {
-                        // ${VAR:-default} or ${VAR-default}
-                        if (use_default) {
-                            // Recursively expand the default value
-                            const expanded_default = try self.expandVariablesAlloc(default_value);
-                            defer self.allocator.free(expanded_default);
-                            try result.appendSlice(self.allocator, expanded_default);
-                        } else if (var_value) |v| {
-                            try result.appendSlice(self.allocator, v);
+                    const pattern_start = i;
+                    while (i < input.len and input[i] != '}') i += 1;
+                    const pattern = input[pattern_start..i];
+                    if (i < input.len and input[i] == '}') i += 1;
+
+                    if (var_value) |v| {
+                        const stripped = stripPrefix(v, pattern, greedy);
+                        try result.appendSlice(self.allocator, stripped);
+                    }
+                } else if (i < input.len and input[i] == '%') {
+                    // ${VAR%pattern} or ${VAR%%pattern} - remove suffix
+                    i += 1;
+                    const greedy = i < input.len and input[i] == '%';
+                    if (greedy) i += 1;
+
+                    const pattern_start = i;
+                    while (i < input.len and input[i] != '}') i += 1;
+                    const pattern = input[pattern_start..i];
+                    if (i < input.len and input[i] == '}') i += 1;
+
+                    if (var_value) |v| {
+                        const stripped = stripSuffix(v, pattern, greedy);
+                        try result.appendSlice(self.allocator, stripped);
+                    }
+                } else if (i < input.len and input[i] == '/') {
+                    // ${VAR/pattern/replacement} or ${VAR//pattern/replacement}
+                    i += 1;
+                    const replace_all = i < input.len and input[i] == '/';
+                    if (replace_all) i += 1;
+
+                    const pattern_start = i;
+                    while (i < input.len and input[i] != '/' and input[i] != '}') i += 1;
+                    const pattern = input[pattern_start..i];
+
+                    var replacement: []const u8 = "";
+                    if (i < input.len and input[i] == '/') {
+                        i += 1;
+                        const repl_start = i;
+                        while (i < input.len and input[i] != '}') i += 1;
+                        replacement = input[repl_start..i];
+                    }
+                    if (i < input.len and input[i] == '}') i += 1;
+
+                    if (var_value) |v| {
+                        const replaced = try patternReplace(self.allocator, v, pattern, replacement, replace_all);
+                        defer self.allocator.free(replaced);
+                        try result.appendSlice(self.allocator, replaced);
+                    }
+                } else if (i < input.len and input[i] == ':' and i + 1 < input.len and
+                    (std.ascii.isDigit(input[i + 1]) or input[i + 1] == '-'))
+                {
+                    // ${VAR:offset} or ${VAR:offset:length} - substring
+                    i += 1;
+                    const offset_start = i;
+                    var negative_offset = false;
+                    if (i < input.len and input[i] == '-') {
+                        negative_offset = true;
+                        i += 1;
+                    }
+                    while (i < input.len and std.ascii.isDigit(input[i])) i += 1;
+                    const offset_str = input[offset_start..i];
+                    const offset = std.fmt.parseInt(i32, offset_str, 10) catch 0;
+
+                    var length: ?usize = null;
+                    if (i < input.len and input[i] == ':') {
+                        i += 1;
+                        const len_start = i;
+                        while (i < input.len and std.ascii.isDigit(input[i])) i += 1;
+                        if (i > len_start) {
+                            length = std.fmt.parseInt(usize, input[len_start..i], 10) catch null;
                         }
-                    },
-                    '+' => {
-                        // ${VAR:+alternate} or ${VAR+alternate}
-                        if (!use_default) {
-                            const expanded_alt = try self.expandVariablesAlloc(default_value);
-                            defer self.allocator.free(expanded_alt);
-                            try result.appendSlice(self.allocator, expanded_alt);
+                    }
+                    if (i < input.len and input[i] == '}') i += 1;
+
+                    if (var_value) |v| {
+                        // Handle negative offset (from end)
+                        var start: usize = 0;
+                        if (offset < 0) {
+                            const abs_offset: usize = @intCast(-offset);
+                            start = if (abs_offset > v.len) 0 else v.len - abs_offset;
+                        } else {
+                            start = @min(@as(usize, @intCast(offset)), v.len);
                         }
-                    },
-                    '?' => {
-                        // ${VAR:?error} or ${VAR?error}
-                        if (use_default) {
-                            try self.stdout().print("zish: {s}: {s}\n", .{ var_name, if (default_value.len > 0) default_value else "parameter not set" });
-                            return error.ParameterNotSet;
-                        } else if (var_value) |v| {
-                            try result.appendSlice(self.allocator, v);
+
+                        const end = if (length) |l| @min(start + l, v.len) else v.len;
+                        try result.appendSlice(self.allocator, v[start..end]);
+                    }
+                } else {
+                    // Original modifier handling: ${VAR:-default}, ${VAR:+alt}, ${VAR:?error}
+                    var modifier: u8 = 0;
+                    var has_colon = false;
+                    var default_value: []const u8 = "";
+
+                    if (i < input.len and input[i] == ':') {
+                        has_colon = true;
+                        i += 1;
+                    }
+
+                    if (i < input.len and (input[i] == '-' or input[i] == '+' or input[i] == '?')) {
+                        modifier = input[i];
+                        i += 1;
+
+                        // Find the default/alternate value up to closing }
+                        const val_start = i;
+                        var brace_depth: u32 = 1;
+                        while (i < input.len and brace_depth > 0) {
+                            if (input[i] == '{') brace_depth += 1;
+                            if (input[i] == '}') brace_depth -= 1;
+                            if (brace_depth > 0) i += 1;
                         }
-                    },
-                    else => {
-                        // No modifier, just ${VAR}
-                        if (var_value) |v| {
-                            try result.appendSlice(self.allocator, v);
-                        }
-                    },
+                        default_value = input[val_start..i];
+                    }
+
+                    // Skip closing }
+                    if (i < input.len and input[i] == '}') i += 1;
+
+                    // Apply modifier
+                    const is_set = var_value != null;
+                    const is_empty = if (var_value) |v| v.len == 0 else true;
+                    const use_default = if (has_colon) !is_set or is_empty else !is_set;
+
+                    switch (modifier) {
+                        '-' => {
+                            // ${VAR:-default} or ${VAR-default}
+                            if (use_default) {
+                                // Recursively expand the default value
+                                const expanded_default = try self.expandVariablesAlloc(default_value);
+                                defer self.allocator.free(expanded_default);
+                                try result.appendSlice(self.allocator, expanded_default);
+                            } else if (var_value) |v| {
+                                try result.appendSlice(self.allocator, v);
+                            }
+                        },
+                        '+' => {
+                            // ${VAR:+alternate} or ${VAR+alternate}
+                            if (!use_default) {
+                                const expanded_alt = try self.expandVariablesAlloc(default_value);
+                                defer self.allocator.free(expanded_alt);
+                                try result.appendSlice(self.allocator, expanded_alt);
+                            }
+                        },
+                        '?' => {
+                            // ${VAR:?error} or ${VAR?error}
+                            if (use_default) {
+                                try self.stdout().print("zish: {s}: {s}\n", .{ var_name, if (default_value.len > 0) default_value else "parameter not set" });
+                                return error.ParameterNotSet;
+                            } else if (var_value) |v| {
+                                try result.appendSlice(self.allocator, v);
+                            }
+                        },
+                        else => {
+                            // No modifier, just ${VAR}
+                            if (var_value) |v| {
+                                try result.appendSlice(self.allocator, v);
+                            } else if (self.opt_nounset) {
+                                std.debug.print("zish: {s}: unbound variable\n", .{var_name});
+                                return error.UnboundVariable;
+                            }
+                        },
+                    }
                 }
             } else {
                 // Simple $VAR without braces
@@ -1924,8 +2265,12 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                         if (env_value) |val| {
                             defer self.allocator.free(val);
                             try result.appendSlice(self.allocator, val);
+                        } else if (self.opt_nounset) {
+                            // nounset: error on unbound variable
+                            std.debug.print("zish: {s}: unbound variable\n", .{var_name});
+                            return error.UnboundVariable;
                         }
-                        // If no variable found, don't expand (leave empty)
+                        // If no variable found and nounset not set, leave empty
                     }
                 } else {
                     // Just a lone $, keep it
@@ -2356,6 +2701,287 @@ fn preprocessHeredoc(allocator: std.mem.Allocator, command: []const u8, delimite
     @memcpy(result[prefix.len + 2 ..][0..tmp_path.len], tmp_path);
 
     return result;
+}
+
+// limits to prevent pathological input from causing resource exhaustion
+const BRACE_MAX_DEPTH: u8 = 10; // max nesting depth for brace expansion
+const BRACE_MAX_RANGE: u32 = 10000; // max elements in a numeric range
+const BRACE_MAX_RESULTS: u32 = 100000; // max total expansion results
+
+/// Expand brace patterns like {a,b,c} and {1..5}
+/// Returns array of expanded strings (caller owns memory)
+pub fn expandBraces(allocator: std.mem.Allocator, input: []const u8) ![][]const u8 {
+    return expandBracesWithDepth(allocator, input, 0);
+}
+
+fn expandBracesWithDepth(allocator: std.mem.Allocator, input: []const u8, depth: u8) ![][]const u8 {
+    // prevent stack overflow from deeply nested braces
+    if (depth >= BRACE_MAX_DEPTH) {
+        const result = try allocator.alloc([]const u8, 1);
+        result[0] = try allocator.dupe(u8, input);
+        return result;
+    }
+
+    // fast path: no braces
+    if (std.mem.indexOfScalar(u8, input, '{') == null) {
+        const result = try allocator.alloc([]const u8, 1);
+        result[0] = try allocator.dupe(u8, input);
+        return result;
+    }
+
+    // find the first complete brace group
+    var brace_start: ?usize = null;
+    var brace_end: ?usize = null;
+    var brace_depth: u32 = 0;
+    var has_comma_or_range = false;
+
+    for (input, 0..) |c, i| {
+        if (c == '{') {
+            if (brace_depth == 0) brace_start = i;
+            brace_depth += 1;
+        } else if (c == '}') {
+            if (brace_depth > 0) {
+                brace_depth -= 1;
+                if (brace_depth == 0) {
+                    brace_end = i;
+                    break;
+                }
+            }
+        } else if (brace_depth == 1) {
+            if (c == ',' or (c == '.' and i + 1 < input.len and input[i + 1] == '.')) {
+                has_comma_or_range = true;
+            }
+        }
+    }
+
+    // no valid brace pattern found
+    if (brace_start == null or brace_end == null or !has_comma_or_range) {
+        const result = try allocator.alloc([]const u8, 1);
+        result[0] = try allocator.dupe(u8, input);
+        return result;
+    }
+
+    const start = brace_start.?;
+    const end = brace_end.?;
+    const prefix = input[0..start];
+    const suffix = input[end + 1 ..];
+    const brace_content = input[start + 1 .. end];
+
+    // parse brace content
+    var expansions = std.ArrayListUnmanaged([]const u8){};
+    defer {
+        for (expansions.items) |exp| allocator.free(exp);
+        expansions.deinit(allocator);
+    }
+
+    // check for range pattern like 1..5 or a..z
+    if (std.mem.indexOf(u8, brace_content, "..")) |range_pos| {
+        const range_start_str = brace_content[0..range_pos];
+        const range_end_str = brace_content[range_pos + 2 ..];
+
+        // try numeric range
+        if (std.fmt.parseInt(i32, range_start_str, 10)) |start_num| {
+            if (std.fmt.parseInt(i32, range_end_str, 10)) |end_num| {
+                // calculate range size and enforce limit
+                const range_size: u32 = @intCast(@abs(@as(i64, end_num) - @as(i64, start_num)) + 1);
+                if (range_size > BRACE_MAX_RANGE) {
+                    // range too large, treat as literal
+                    const result = try allocator.alloc([]const u8, 1);
+                    result[0] = try allocator.dupe(u8, input);
+                    return result;
+                }
+
+                const step: i32 = if (start_num <= end_num) 1 else -1;
+                var n = start_num;
+                while (true) {
+                    var buf: [16]u8 = undefined;
+                    const num_str = std.fmt.bufPrint(&buf, "{d}", .{n}) catch break;
+                    try expansions.append(allocator, try allocator.dupe(u8, num_str));
+                    if (n == end_num) break;
+                    n += step;
+                }
+            } else |_| {}
+        } else |_| {
+            // try character range (always limited to 256 max)
+            if (range_start_str.len == 1 and range_end_str.len == 1) {
+                const start_char = range_start_str[0];
+                const end_char = range_end_str[0];
+                if (std.ascii.isAlphabetic(start_char) and std.ascii.isAlphabetic(end_char)) {
+                    const step: i8 = if (start_char <= end_char) 1 else -1;
+                    var c = start_char;
+                    while (true) {
+                        try expansions.append(allocator, try allocator.dupe(u8, &[_]u8{c}));
+                        if (c == end_char) break;
+                        c = @intCast(@as(i16, c) + step);
+                    }
+                }
+            }
+        }
+    }
+
+    // if range didn't produce expansions, parse as comma-separated list
+    if (expansions.items.len == 0) {
+        var item_start: usize = 0;
+        var item_depth: u32 = 0;
+        for (brace_content, 0..) |c, i| {
+            if (c == '{') {
+                item_depth += 1;
+            } else if (c == '}') {
+                if (item_depth > 0) item_depth -= 1;
+            } else if (c == ',' and item_depth == 0) {
+                try expansions.append(allocator, try allocator.dupe(u8, brace_content[item_start..i]));
+                item_start = i + 1;
+            }
+        }
+        // last item
+        try expansions.append(allocator, try allocator.dupe(u8, brace_content[item_start..]));
+    }
+
+    // build results with prefix and suffix, then recursively expand
+    var results = std.ArrayListUnmanaged([]const u8){};
+    errdefer {
+        for (results.items) |r| allocator.free(r);
+        results.deinit(allocator);
+    }
+
+    for (expansions.items) |exp| {
+        // build: prefix + exp + suffix
+        const combined = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, exp, suffix });
+        defer allocator.free(combined);
+
+        // recursively expand any remaining braces (with depth tracking)
+        const sub_results = try expandBracesWithDepth(allocator, combined, depth + 1);
+        defer allocator.free(sub_results);
+
+        for (sub_results) |sub| {
+            // enforce total result limit
+            if (results.items.len >= BRACE_MAX_RESULTS) {
+                allocator.free(sub);
+                continue;
+            }
+            try results.append(allocator, sub);
+        }
+    }
+
+    // clear expansions without freeing (we already transferred ownership conceptually,
+    // but the errdefer above handles cleanup, and we've moved strings to results)
+    expansions.clearRetainingCapacity();
+
+    return try results.toOwnedSlice(allocator);
+}
+
+/// Free brace expansion results
+pub fn freeBraceResults(allocator: std.mem.Allocator, results: [][]const u8) void {
+    for (results) |r| allocator.free(r);
+    allocator.free(results);
+}
+
+/// Strip prefix from string using glob pattern matching
+/// If greedy is true, removes longest match; otherwise removes shortest match
+fn stripPrefix(str: []const u8, pattern: []const u8, greedy: bool) []const u8 {
+    if (str.len == 0 or pattern.len == 0) return str;
+
+    // For greedy, try matching from longest to shortest
+    // For non-greedy, try matching from shortest to longest
+    if (greedy) {
+        var match_len = str.len;
+        while (match_len > 0) : (match_len -= 1) {
+            if (glob.matchGlob(pattern, str[0..match_len])) {
+                return str[match_len..];
+            }
+        }
+    } else {
+        var match_len: usize = 1;
+        while (match_len <= str.len) : (match_len += 1) {
+            if (glob.matchGlob(pattern, str[0..match_len])) {
+                return str[match_len..];
+            }
+        }
+    }
+    return str;
+}
+
+/// Strip suffix from string using glob pattern matching
+/// If greedy is true, removes longest match; otherwise removes shortest match
+fn stripSuffix(str: []const u8, pattern: []const u8, greedy: bool) []const u8 {
+    if (str.len == 0 or pattern.len == 0) return str;
+
+    // For greedy, try matching from longest to shortest
+    // For non-greedy, try matching from shortest to longest
+    if (greedy) {
+        var match_start: usize = 0;
+        while (match_start < str.len) : (match_start += 1) {
+            if (glob.matchGlob(pattern, str[match_start..])) {
+                return str[0..match_start];
+            }
+        }
+    } else {
+        var match_start = str.len;
+        while (match_start > 0) : (match_start -= 1) {
+            if (glob.matchGlob(pattern, str[match_start - 1 ..])) {
+                return str[0 .. match_start - 1];
+            }
+        }
+    }
+    return str;
+}
+
+/// Replace pattern in string with replacement
+/// If replace_all is true, replaces all occurrences; otherwise only first
+fn patternReplace(allocator: std.mem.Allocator, str: []const u8, pattern: []const u8, replacement: []const u8, replace_all: bool) ![]const u8 {
+    if (str.len == 0 or pattern.len == 0) return try allocator.dupe(u8, str);
+
+    var result = std.ArrayListUnmanaged(u8){};
+    defer result.deinit(allocator);
+
+    var i: usize = 0;
+    var replaced = false;
+
+    while (i < str.len) {
+        // Try to match pattern at this position
+        var matched = false;
+        if (!replaced or replace_all) {
+            // Try each possible match length at this position
+            var match_len = str.len - i;
+            while (match_len > 0) : (match_len -= 1) {
+                if (glob.matchGlob(pattern, str[i .. i + match_len])) {
+                    try result.appendSlice(allocator, replacement);
+                    i += match_len;
+                    matched = true;
+                    replaced = true;
+                    break;
+                }
+            }
+        }
+
+        if (!matched) {
+            try result.append(allocator, str[i]);
+            i += 1;
+        }
+    }
+
+    return try result.toOwnedSlice(allocator);
+}
+
+/// Check if input contains brace expansion patterns
+pub fn hasBracePattern(input: []const u8) bool {
+    var depth: u32 = 0;
+    var has_content = false;
+    for (input, 0..) |c, i| {
+        if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
+            if (depth > 0) {
+                depth -= 1;
+                if (depth == 0 and has_content) return true;
+            }
+        } else if (depth == 1) {
+            if (c == ',' or (c == '.' and i + 1 < input.len and input[i + 1] == '.')) {
+                has_content = true;
+            }
+        }
+    }
+    return false;
 }
 
 /// Check if heredoc is complete (delimiter found on its own line)

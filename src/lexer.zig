@@ -307,8 +307,16 @@ pub const Lexer = struct {
                             return self.makeTokenValue(.RightParen, ")");
                         },
                         '{' => {
-                            _ = self.advance();
-                            return self.makeTokenValue(.LeftBrace, "{");
+                            // Check if this is a brace expansion pattern {a,b} or {1..5}
+                            // vs command grouping { cmd; }
+                            if (self.isBraceExpansion()) {
+                                self.brace_depth = 1;
+                                self.state = .word;
+                                _ = self.advance();
+                            } else {
+                                _ = self.advance();
+                                return self.makeTokenValue(.LeftBrace, "{");
+                            }
                         },
                         '}' => {
                             _ = self.advance();
@@ -389,12 +397,84 @@ pub const Lexer = struct {
                 },
 
                 .word => {
-                    if (c == null or isOperator(c.?)) {
+                    if (c == null) {
+                        self.brace_depth = 0;
                         self.state = .normal;
                         return self.makeToken(.Word);
                     }
 
                     const ch = c.?;
+
+                    // Handle braces within words (for brace expansion)
+                    if (ch == '{') {
+                        self.brace_depth += 1;
+                        if (self.use_buf) self.bufAppend(ch);
+                        _ = self.advance();
+                        continue;
+                    }
+                    if (ch == '}') {
+                        if (self.brace_depth > 0) {
+                            self.brace_depth -= 1;
+                            if (self.use_buf) self.bufAppend(ch);
+                            _ = self.advance();
+                            // If brace_depth is now 0, check if word continues
+                            if (self.brace_depth == 0) {
+                                if (self.peek()) |next| {
+                                    // Word continues if next char is { (new brace group)
+                                    // or a non-operator character
+                                    if (next != '{' and isOperator(next)) {
+                                        self.state = .normal;
+                                        return self.makeToken(.Word);
+                                    }
+                                } else {
+                                    self.state = .normal;
+                                    return self.makeToken(.Word);
+                                }
+                            }
+                            continue;
+                        } else {
+                            // Unmatched }, end word
+                            self.state = .normal;
+                            return self.makeToken(.Word);
+                        }
+                    }
+
+                    // Handle array assignment parens: continue collecting if inside array assign
+                    if (ch == '(' and self.paren_depth > 0) {
+                        self.paren_depth += 1;
+                        if (self.use_buf) self.bufAppend(ch);
+                        _ = self.advance();
+                        continue;
+                    }
+                    if (ch == ')' and self.paren_depth > 0) {
+                        self.paren_depth -= 1;
+                        if (self.use_buf) self.bufAppend(ch);
+                        _ = self.advance();
+                        if (self.paren_depth == 0) {
+                            // End of array assignment
+                            self.state = .normal;
+                            return self.makeToken(.Word);
+                        }
+                        continue;
+                    }
+
+                    // For other operators, only end word if not inside braces and not in array assignment
+                    if (isOperator(ch) and self.brace_depth == 0 and self.paren_depth == 0) {
+                        // Check for array assignment: var=(...)
+                        // If current word ends with `=` and ch is `(`, start array assignment
+                        if (ch == '(') {
+                            const word_so_far = self.currentTokenValue();
+                            if (word_so_far.len > 0 and word_so_far[word_so_far.len - 1] == '=') {
+                                self.switchToBuf();
+                                self.bufAppend('(');
+                                _ = self.advance();
+                                self.paren_depth = 1;
+                                continue;
+                            }
+                        }
+                        self.state = .normal;
+                        return self.makeToken(.Word);
+                    }
 
                     // Check for URL pattern: if we see :// transition to URL mode
                     if (ch == ':' and self.peekN(1) == @as(u8, '/') and self.peekN(2) == @as(u8, '/')) {
@@ -816,6 +896,58 @@ pub const Lexer = struct {
             self.buf_len = current.len;
             self.use_buf = true;
         }
+    }
+
+    /// Get the current token value being built (for lookahead checks)
+    fn currentTokenValue(self: *Self) []const u8 {
+        if (self.use_buf) {
+            return self.buf[self.buf_idx][0..self.buf_len];
+        } else {
+            return self.input[self.token_start..self.pos];
+        }
+    }
+
+    /// Check if current position starts a brace expansion pattern like {a,b} or {1..5}
+    /// vs command grouping { cmd; } (which has whitespace after {)
+    fn isBraceExpansion(self: *Self) bool {
+        // Look ahead from current position (which is at '{')
+        var i = self.pos + 1;
+        var depth: u32 = 1;
+        var has_comma_or_range = false;
+
+        // Command grouping: { must be followed by whitespace
+        // Brace expansion: { is followed by content directly
+        if (i < self.input.len and (self.input[i] == ' ' or self.input[i] == '\t' or self.input[i] == '\n')) {
+            return false; // command grouping
+        }
+
+        while (i < self.input.len and depth > 0) {
+            const c = self.input[i];
+            switch (c) {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if (depth == 0 and has_comma_or_range) return true;
+                },
+                ',' => {
+                    if (depth == 1) has_comma_or_range = true;
+                },
+                '.' => {
+                    // Check for .. range pattern
+                    if (depth == 1 and i + 1 < self.input.len and self.input[i + 1] == '.') {
+                        has_comma_or_range = true;
+                    }
+                },
+                // Shell operators that indicate command grouping, not brace expansion
+                ' ', '\t', '\n', ';', '|', '&' => {
+                    if (depth == 1) return false;
+                },
+                else => {},
+            }
+            i += 1;
+        }
+
+        return has_comma_or_range;
     }
 };
 

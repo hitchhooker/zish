@@ -10,6 +10,7 @@ pub fn ctrlKey(comptime char_code: u8) u8 {
 pub const CTRL_C = ctrlKey('c');
 pub const CTRL_L = ctrlKey('l');
 pub const CTRL_D = ctrlKey('d');
+pub const CTRL_Z = ctrlKey('z');
 
 // Vim modes
 pub const VimMode = enum {
@@ -115,6 +116,7 @@ pub const Action = union(enum) {
     undo,
     enter_paste_mode,
     exit_paste_mode,
+    suspend_shell,
 };
 
 const CTRL_W = 23;
@@ -126,6 +128,7 @@ pub fn insertModeAction(char: u8) Action {
         CTRL_C => .cancel,
         CTRL_L => .clear_screen,
         CTRL_D => .exit_shell,
+        CTRL_Z => .suspend_shell,
         CTRL_W => .delete_word_backward,
         '\t' => .tap_complete,
         8, 127 => .backspace,
@@ -177,6 +180,7 @@ pub fn normalModeAction(char: u8) Action {
         '\n' => .execute_command,
 
         CTRL_C => .cancel,
+        CTRL_Z => .suspend_shell,
 
         else => .none,
     };

@@ -5,6 +5,7 @@ const glob = @import("glob.zig");
 const Shell = @import("Shell.zig");
 const parser = @import("parser.zig");
 const builtins = @import("builtins.zig");
+const jobs = @import("jobs.zig");
 
 // Fast integer parsing for small numbers - SectorLambda-inspired
 // Optimized for the common case of small positive integers (loop counters, etc.)
@@ -428,14 +429,36 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     // Skip fast path if any arg has command substitution $(cmd) (not $((arith)))
     // Falls back to normal path if args too large for stack buffers
     if (std.mem.eql(u8, raw_cmd, "echo")) {
-        var has_cmd_subst = false;
+        var needs_full_expansion = false;
         for (node.children[1..]) |arg_node| {
-            if (hasCommandSubstitution(arg_node.value)) {
-                has_cmd_subst = true;
+            const arg = arg_node.value;
+            // Check for features that need full expansion path:
+            // - Command substitution $(...)
+            // - Brace expansion {a,b}
+            // - Parameter expansion ${VAR#...}, ${VAR%...}, ${VAR/...}
+            if (hasCommandSubstitution(arg)) {
+                needs_full_expansion = true;
                 break;
             }
+            if (Shell.hasBracePattern(arg)) {
+                needs_full_expansion = true;
+                break;
+            }
+            // Check for ${...} with modifiers (contains ${...#, ${...%, ${.../, ${...:, ${...[)
+            // Also need full path for array access ${arr[...]}
+            if (std.mem.indexOf(u8, arg, "${")) |dollar_brace| {
+                const rest = arg[dollar_brace + 2 ..];
+                for (rest) |c| {
+                    if (c == '}') break;
+                    if (c == '#' or c == '%' or c == '/' or c == ':' or c == '[') {
+                        needs_full_expansion = true;
+                        break;
+                    }
+                }
+                if (needs_full_expansion) break;
+            }
         }
-        if (!has_cmd_subst) {
+        if (!needs_full_expansion and !shell.opt_nounset and !shell.opt_xtrace) {
             if (evaluateEchoBuiltinFast(shell, node)) |result| {
                 return result;
             } else |err| switch (err) {
@@ -510,29 +533,53 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     for (node.children[1..]) |arg_node| {
         const arg = arg_node.value;
 
-        // First expand variables (skip for single-quoted strings)
-        const var_expanded_result = if (arg_node.node_type == .string)
-            Shell.ExpandResult{ .slice = arg, .owned = false }
-        else
-            try shell.expandVariablesZ(arg);
-        defer var_expanded_result.deinit(shell.allocator);
-        const var_expanded = var_expanded_result.slice;
-
-        // Then expand globs (only if pattern contains glob chars)
-        if (glob.hasGlobChars(var_expanded)) {
-            const glob_results = try glob.expandGlob(shell.allocator, var_expanded);
-            defer glob.freeGlobResults(shell.allocator, glob_results);
-
-            if (glob_results.len == 0) {
-                try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded));
-            } else {
-                for (glob_results) |match| {
-                    try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, match));
-                }
-            }
-        } else {
-            try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded));
+        // Skip brace expansion for single-quoted strings
+        if (arg_node.node_type == .string) {
+            try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, arg));
+            continue;
         }
+
+        // Step 1: Brace expansion {a,b,c} or {1..5}
+        const brace_results = if (Shell.hasBracePattern(arg))
+            try Shell.expandBraces(shell.allocator, arg)
+        else
+            null;
+        defer if (brace_results) |br| Shell.freeBraceResults(shell.allocator, br);
+
+        const items_to_expand = if (brace_results) |br| br else &[_][]const u8{arg};
+
+        for (items_to_expand) |item| {
+            // Step 2: Variable expansion
+            const var_expanded_result = try shell.expandVariablesZ(item);
+            defer var_expanded_result.deinit(shell.allocator);
+            const var_expanded = var_expanded_result.slice;
+
+            // Step 3: Glob expansion (only if pattern contains glob chars)
+            if (glob.hasGlobChars(var_expanded)) {
+                const glob_results = try glob.expandGlob(shell.allocator, var_expanded);
+                defer glob.freeGlobResults(shell.allocator, glob_results);
+
+                if (glob_results.len == 0) {
+                    try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded));
+                } else {
+                    for (glob_results) |match| {
+                        try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, match));
+                    }
+                }
+            } else {
+                try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded));
+            }
+        }
+    }
+
+    // xtrace: print expanded command before execution (to stderr)
+    if (shell.opt_xtrace) {
+        std.debug.print("+ ", .{});
+        for (expanded_args.items, 0..) |arg, idx| {
+            if (idx > 0) std.debug.print(" ", .{});
+            std.debug.print("{s}", .{arg});
+        }
+        std.debug.print("\n", .{});
     }
 
     // dispatch to builtins module
@@ -940,18 +987,27 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     defer std.posix.sigaction(std.posix.SIG.INT, &old_sigint, null);
 
     var last_status: u8 = 0;
+    var pipefail_status: u8 = 0; // first non-zero status for pipefail
+
     for (pids) |pid| {
         const result = std.posix.waitpid(pid, 0);
+        var status: u8 = 0;
         if (std.posix.W.IFEXITED(result.status)) {
-            last_status = std.posix.W.EXITSTATUS(result.status);
+            status = std.posix.W.EXITSTATUS(result.status);
         } else if (std.posix.W.IFSIGNALED(result.status)) {
-            last_status = @truncate(128 + std.posix.W.TERMSIG(result.status));
+            status = @truncate(128 + std.posix.W.TERMSIG(result.status));
         } else {
-            last_status = 127;
+            status = 127;
+        }
+        last_status = status;
+        // pipefail: remember first non-zero status
+        if (shell.opt_pipefail and status != 0 and pipefail_status == 0) {
+            pipefail_status = status;
         }
     }
 
-    return last_status;
+    // pipefail: return first non-zero status if any command failed
+    return if (shell.opt_pipefail and pipefail_status != 0) pipefail_status else last_status;
 }
 
 pub fn evaluateLogicalAnd(shell: *Shell, node: *const ast.AstNode) !u8 {
@@ -1062,6 +1118,10 @@ pub fn evaluateList(shell: *Shell, node: *const ast.AstNode) !u8 {
         shell.last_exit_code = last_status;
         // propagate break/continue signals up
         if (last_status == 253 or last_status == 254) return last_status;
+        // errexit: exit on non-zero status (but not for conditionals/loops)
+        if (shell.opt_errexit and last_status != 0) {
+            return last_status;
+        }
     }
     return last_status;
 }
@@ -1069,55 +1129,129 @@ pub fn evaluateList(shell: *Shell, node: *const ast.AstNode) !u8 {
 pub fn evaluateAssignment(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len != 2) return 1;
 
-    const name = node.children[0].value;
+    var name = node.children[0].value;
     const value = node.children[1].value;
 
-    // Fast path for pure arithmetic assignments like i=$((i+1))
+    // check for array append syntax: arr+=(values)
+    const is_append = name.len > 0 and name[name.len - 1] == '+';
+    if (is_append) {
+        name = name[0 .. name.len - 1];
+    }
+
+    // check for array element assignment: arr[n]=value
+    if (std.mem.indexOfScalar(u8, name, '[')) |bracket_pos| {
+        if (std.mem.indexOfScalar(u8, name[bracket_pos..], ']')) |close_offset| {
+            const arr_name = name[0..bracket_pos];
+            const index_str = name[bracket_pos + 1 .. bracket_pos + close_offset];
+
+            // parse index (can be arithmetic expression)
+            const index = if (index_str.len > 0)
+                @as(usize, @intCast(@max(0, shell.evaluateArithmetic(index_str) catch 0)))
+            else
+                0;
+
+            const expanded_value = try shell.expandVariables(value);
+            defer shell.allocator.free(expanded_value);
+
+            try shell.setArrayElement(arr_name, index, expanded_value);
+            return 0;
+        }
+    }
+
+    // check for array assignment: arr=(a b c)
+    if (value.len >= 2 and value[0] == '(' and value[value.len - 1] == ')') {
+        const array_content = value[1 .. value.len - 1];
+
+        // parse array elements (space-separated, respecting quotes)
+        var elements = std.ArrayListUnmanaged([]const u8){};
+        defer {
+            for (elements.items) |elem| shell.allocator.free(elem);
+            elements.deinit(shell.allocator);
+        }
+
+        var i: usize = 0;
+        while (i < array_content.len) {
+            // skip whitespace
+            while (i < array_content.len and (array_content[i] == ' ' or array_content[i] == '\t')) {
+                i += 1;
+            }
+            if (i >= array_content.len) break;
+
+            const elem_start = i;
+            var in_quote: u8 = 0;
+
+            // parse element (handle quotes)
+            while (i < array_content.len) {
+                const c = array_content[i];
+                if (in_quote != 0) {
+                    if (c == in_quote) in_quote = 0;
+                } else if (c == '"' or c == '\'') {
+                    in_quote = c;
+                } else if (c == ' ' or c == '\t') {
+                    break;
+                }
+                i += 1;
+            }
+
+            if (i > elem_start) {
+                var elem = array_content[elem_start..i];
+                // strip quotes if present
+                if (elem.len >= 2 and ((elem[0] == '"' and elem[elem.len - 1] == '"') or
+                    (elem[0] == '\'' and elem[elem.len - 1] == '\'')))
+                {
+                    elem = elem[1 .. elem.len - 1];
+                }
+                // expand variables in element
+                const expanded = try shell.expandVariables(elem);
+                try elements.append(shell.allocator, expanded);
+            }
+        }
+
+        if (is_append) {
+            try shell.appendArray(name, elements.items);
+        } else {
+            try shell.setArray(name, elements.items);
+        }
+        return 0;
+    }
+
+    // fast path for pure arithmetic assignments like i=$((i+1))
     if (value.len >= 5 and std.mem.startsWith(u8, value, "$((") and value[value.len - 2] == ')' and value[value.len - 1] == ')') {
         const expr = value[3 .. value.len - 2];
         const arith_result = shell.evaluateArithmetic(expr) catch 0;
 
-        // Format result into stack buffer
         var result_buf: [32]u8 = undefined;
         const result_str = std.fmt.bufPrint(&result_buf, "{d}", .{arith_result}) catch return 1;
 
-        // Try to update existing variable in-place, reusing buffer if possible
         if (shell.variables.getPtr(name)) |value_ptr| {
             const old_value = value_ptr.*;
-            // Reuse existing buffer if it can hold the new value (avoid alloc/free)
             if (result_str.len <= old_value.len) {
-                // Copy into existing buffer - this is a u8 slice, need to cast for write
                 const writable: [*]u8 = @ptrCast(@constCast(old_value.ptr));
                 @memcpy(writable[0..result_str.len], result_str);
-                // Update slice length by replacing with trimmed slice
                 value_ptr.* = writable[0..result_str.len];
             } else {
-                // Need larger buffer - free and allocate
                 shell.allocator.free(old_value);
                 value_ptr.* = try shell.allocator.dupe(u8, result_str);
             }
             return 0;
         }
 
-        // New variable - need to allocate name and value
         const name_copy = try shell.allocator.dupe(u8, name);
         const value_copy = try shell.allocator.dupe(u8, result_str);
         try shell.variables.put(name_copy, value_copy);
         return 0;
     }
 
-    // expand value BEFORE removing old variable (in case value references the variable being assigned)
+    // regular scalar assignment
     const expanded_value = try shell.expandVariables(value);
     defer shell.allocator.free(expanded_value);
 
-    // Try to update existing variable in-place (reuse key)
     if (shell.variables.getPtr(name)) |value_ptr| {
         shell.allocator.free(value_ptr.*);
         value_ptr.* = try shell.allocator.dupe(u8, expanded_value);
         return 0;
     }
 
-    // New variable - allocate name and value
     const name_copy = try shell.allocator.dupe(u8, name);
     const value_copy = try shell.allocator.dupe(u8, expanded_value);
     try shell.variables.put(name_copy, value_copy);
@@ -1224,45 +1358,77 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     outer: for (values) |value_node| {
-        // Fast path: if no variables or globs, use the value directly
         const raw_value = value_node.value;
-        const needs_expansion = value_node.node_type != .string and
-            std.mem.indexOfScalar(u8, raw_value, '$') != null;
-        const has_glob = glob.hasGlobChars(raw_value);
 
-        if (!needs_expansion and !has_glob) {
-            // Direct iteration - use cached pointer for zero-lookup assignment
+        // Skip all expansion for single-quoted strings
+        if (value_node.node_type == .string) {
             setForVariableFast(cached_value_ptr.?, raw_value, &loop_buf, &heap_buf, shell.allocator);
             last_status = try evaluateAst(shell, body);
             if (last_status == 254) {
                 should_break = true;
                 break :outer;
             }
-            if (last_status == 253) {
-                last_status = 0;
-            }
+            if (last_status == 253) last_status = 0;
             continue;
         }
 
-        // Slow path: need to expand variables or globs
-        const var_expanded = if (value_node.node_type == .string)
-            try shell.allocator.dupe(u8, raw_value)
+        const has_brace = Shell.hasBracePattern(raw_value);
+        const needs_var_expansion = std.mem.indexOfScalar(u8, raw_value, '$') != null;
+        const has_glob = glob.hasGlobChars(raw_value);
+
+        // Fast path: no special expansion needed
+        if (!has_brace and !needs_var_expansion and !has_glob) {
+            setForVariableFast(cached_value_ptr.?, raw_value, &loop_buf, &heap_buf, shell.allocator);
+            last_status = try evaluateAst(shell, body);
+            if (last_status == 254) {
+                should_break = true;
+                break :outer;
+            }
+            if (last_status == 253) last_status = 0;
+            continue;
+        }
+
+        // Step 1: Brace expansion
+        const brace_results = if (has_brace)
+            try Shell.expandBraces(shell.allocator, raw_value)
         else
-            try shell.expandVariables(raw_value);
-        defer shell.allocator.free(var_expanded);
+            null;
+        defer if (brace_results) |br| Shell.freeBraceResults(shell.allocator, br);
 
-        // Only expand globs if pattern contains glob chars
-        if (has_glob) {
-            const glob_results = try glob.expandGlob(shell.allocator, var_expanded);
-            defer glob.freeGlobResults(shell.allocator, glob_results);
+        const brace_items = if (brace_results) |br| br else &[_][]const u8{raw_value};
 
-            const items = if (glob_results.len == 0)
-                &[_][]const u8{var_expanded}
+        for (brace_items) |brace_item| {
+            // Step 2: Variable expansion
+            const var_expanded = if (needs_var_expansion or (brace_results != null))
+                try shell.expandVariables(brace_item)
             else
-                glob_results;
+                try shell.allocator.dupe(u8, brace_item);
+            defer shell.allocator.free(var_expanded);
 
-            for (items) |item| {
-                setForVariableFast(cached_value_ptr.?, item, &loop_buf, &heap_buf, shell.allocator);
+            // Step 3: Glob expansion
+            if (glob.hasGlobChars(var_expanded)) {
+                const glob_results = try glob.expandGlob(shell.allocator, var_expanded);
+                defer glob.freeGlobResults(shell.allocator, glob_results);
+
+                const items = if (glob_results.len == 0)
+                    &[_][]const u8{var_expanded}
+                else
+                    glob_results;
+
+                for (items) |item| {
+                    setForVariableFast(cached_value_ptr.?, item, &loop_buf, &heap_buf, shell.allocator);
+                    last_status = try evaluateAst(shell, body);
+                    if (last_status == 254) {
+                        should_break = true;
+                        break :outer;
+                    }
+                    if (last_status == 253) {
+                        last_status = 0;
+                        continue;
+                    }
+                }
+            } else {
+                setForVariableFast(cached_value_ptr.?, var_expanded, &loop_buf, &heap_buf, shell.allocator);
                 last_status = try evaluateAst(shell, body);
                 if (last_status == 254) {
                     should_break = true;
@@ -1270,19 +1436,7 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
                 }
                 if (last_status == 253) {
                     last_status = 0;
-                    continue;
                 }
-            }
-        } else {
-            // No glob, just use expanded value
-            setForVariableFast(cached_value_ptr.?, var_expanded, &loop_buf, &heap_buf, shell.allocator);
-            last_status = try evaluateAst(shell, body);
-            if (last_status == 254) {
-                should_break = true;
-                break :outer;
-            }
-            if (last_status == 253) {
-                last_status = 0;
             }
         }
     }
@@ -1351,27 +1505,59 @@ pub fn evaluateBackground(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     const command = node.children[0];
 
-    // Flush stdout buffer before forking
+    // get command string for job display by serializing AST
+    var cmd_buf = std.ArrayListUnmanaged(u8){};
+    defer cmd_buf.deinit(shell.allocator);
+    serializeAst(shell.allocator, &cmd_buf, command) catch {};
+    const cmd_str = if (cmd_buf.items.len > 0) cmd_buf.items else command.value;
+
+    // flush stdout buffer before forking to prevent double-writes
     shell.stdout().flush() catch {};
 
-    // Fork to run command in background
+    // fork to run command in background
     const pid = std.posix.fork() catch {
         try shell.stdout().writeAll("zish: fork failed\n");
         return 1;
     };
 
     if (pid == 0) {
-        // Child process: run the command
-        // After fork, the parent's allocator (GPA) may not work correctly.
-        // Switch to page_allocator which is fork-safe.
+        // === CHILD PROCESS ===
+        // SAFETY: After fork, parent's GPA state may be inconsistent if fork
+        // occurred during an allocation. Switch to page_allocator immediately.
+        // This allocator is stateless and safe to use post-fork.
         shell.allocator = std.heap.page_allocator;
+
+        // set up process group for job control
+        jobs.launchProcess(0, 0, false, std.posix.STDIN_FILENO);
+
+        // Mark as in_pipeline so external commands exec directly
+        // instead of forking again (avoids double-fork for bg jobs)
+        shell.in_pipeline = true;
+
+        // evaluate command and exit with its status
         const status = evaluateAst(shell, command) catch 127;
         shell.stdout().flush() catch {};
         std.posix.exit(status);
     }
 
-    // Parent: print background job info and return immediately
-    shell.stdout().print("[1] {d}\n", .{pid}) catch {};
+    // === PARENT PROCESS ===
+    // both parent and child call setpgid to avoid race condition
+    // (whichever runs first establishes the group)
+    std.posix.setpgid(pid, pid) catch |err| {
+        // EACCES: child already exec'd (fine, it set its own pgrp)
+        // ESRCH: child already exited (fine, we'll reap it)
+        if (err != error.PermissionDenied and err != error.ProcessNotFound) {
+            std.debug.print("zish: setpgid({d}): {}\n", .{ pid, err });
+        }
+    };
+
+    // add job to table
+    const job_id = shell.job_table.addJob(pid, cmd_str, false) catch {
+        try shell.stdout().print("[?] {d}\n", .{pid});
+        return 0;
+    };
+
+    try shell.stdout().print("[{d}] {d}\n", .{ job_id, pid });
     return 0;
 }
 
