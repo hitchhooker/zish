@@ -378,6 +378,35 @@ pub fn renderLine(self: *Shell) !void {
     try self.term_view.render(&self.edit_buf, prompt.slice, prompt.visible_len);
 }
 
+/// Show live search results as user types
+fn showSearchMatch(self: *Shell) !void {
+    const writer = self.stdout();
+    const search_term = self.search_buffer[0..self.search_len];
+
+    // clear line and show search prompt with query
+    try writer.writeAll("\r\x1b[K(reverse-i-search): ");
+    try writer.writeAll(search_term);
+
+    // find and show best match
+    if (self.search_len > 0 and self.history != null) {
+        const matches = self.history.?.fuzzySearch(search_term, self.allocator) catch return;
+        defer self.allocator.free(matches);
+
+        if (matches.len > 0) {
+            const entry_idx = matches[0].entry_index;
+            const entry = self.history.?.entries.items[entry_idx];
+            const cmd = self.history.?.getCommand(entry);
+
+            // show match after separator
+            try writer.writeAll(" → ");
+            try writer.writeAll(cmd);
+
+            // store match in edit buffer for when user presses enter
+            self.edit_buf.set(cmd);
+        }
+    }
+}
+
 const PromptInfo = struct {
     slice: []const u8,
     visible_len: u16,
@@ -786,11 +815,11 @@ fn handleAction(self: *Shell, action: Action) !void {
             completion_mod.exitCompletionMode(self);
 
             if (self.search_mode) {
-                // Add to search buffer
+                // Add to search buffer and show live results
                 if (self.search_len < self.search_buffer.len) {
                     self.search_buffer[self.search_len] = char;
                     self.search_len += 1;
-                    try self.stdout().writeByte(char);
+                    try self.showSearchMatch();
                 }
             } else {
                 // Use new edit_buf for insertion
@@ -812,7 +841,7 @@ fn handleAction(self: *Shell, action: Action) !void {
             if (self.search_mode) {
                 if (self.search_len > 0) {
                     self.search_len -= 1;
-                    try self.stdout().writeAll("\x08 \x08");
+                    try self.showSearchMatch();
                 }
             } else {
                 if (self.edit_buf.delete()) {
@@ -1027,8 +1056,11 @@ fn handleAction(self: *Shell, action: Action) !void {
         .enter_search_mode => |direction| {
             self.search_mode = true;
             self.search_len = 0;
-            const search_char: u8 = if (direction == .forward) '/' else '?';
-            try self.stdout().writeByte(search_char);
+            if (direction == .backward) {
+                try self.stdout().writeAll("\r\x1b[K(reverse-i-search): ");
+            } else {
+                try self.stdout().writeAll("\r\x1b[K(forward-i-search): ");
+            }
         },
 
         .exit_search_mode => |execute| {

@@ -10,6 +10,7 @@ pub fn ctrlKey(comptime char_code: u8) u8 {
 pub const CTRL_C = ctrlKey('c');
 pub const CTRL_L = ctrlKey('l');
 pub const CTRL_D = ctrlKey('d');
+pub const CTRL_R = ctrlKey('r');
 pub const CTRL_Z = ctrlKey('z');
 
 // Vim modes
@@ -128,6 +129,7 @@ pub fn insertModeAction(char: u8) Action {
         CTRL_C => .cancel,
         CTRL_L => .clear_screen,
         CTRL_D => .exit_shell,
+        CTRL_R => .{ .enter_search_mode = .backward }, // reverse history search
         CTRL_Z => .suspend_shell,
         CTRL_W => .delete_word_backward,
         '\t' => .tap_complete,
