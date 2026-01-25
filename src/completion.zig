@@ -103,8 +103,12 @@ pub fn handleTabCompletion(self: *Shell) !void {
     var expanded_dir_buf: [4096]u8 = undefined;
     var expanded_word_buf: [4096]u8 = undefined;
 
+    // track if we inserted a / for directory completion
+    var inserted_slash = false;
+    var effective_word_end = word_end;
+
     // check if word (without trailing /) is an existing directory
-    // if so, treat it as if it had trailing / to complete inside
+    // if so, insert / and treat it as if it had trailing / to complete inside
     const effective_word: []const u8 = blk: {
         if (word.len == 0 or std.mem.endsWith(u8, word, "/")) break :blk word;
 
@@ -121,15 +125,21 @@ pub fn handleTabCompletion(self: *Shell) !void {
             break :blk word;
         } else word;
 
-        // check if it's a directory
-        const stat = std.fs.cwd().statFile(check_path) catch break :blk word;
-        if (stat.kind == .directory) {
-            // it's a directory - append / conceptually
-            if (word.len + 1 < expanded_word_buf.len) {
-                @memcpy(expanded_word_buf[0..word.len], word);
-                expanded_word_buf[word.len] = '/';
-                break :blk expanded_word_buf[0 .. word.len + 1];
-            }
+        // check if it's a directory by trying to open it (more reliable than stat)
+        var d = std.fs.cwd().openDir(check_path, .{}) catch break :blk word;
+        d.close();
+
+        // it's a directory - insert / into buffer and update effective_word
+        self.edit_buf.cursor = @intCast(word_end);
+        _ = self.edit_buf.insertSlice("/");
+        effective_word_end = word_end + 1;
+        inserted_slash = true;
+
+        // append / conceptually for pattern matching
+        if (word.len + 1 < expanded_word_buf.len) {
+            @memcpy(expanded_word_buf[0..word.len], word);
+            expanded_word_buf[word.len] = '/';
+            break :blk expanded_word_buf[0 .. word.len + 1];
         }
         break :blk word;
     };
@@ -230,7 +240,19 @@ pub fn handleTabCompletion(self: *Shell) !void {
             }
 
             if (!already_exists) {
-                const full_name = if (entry.kind == .directory)
+                // check if entry is a directory - use fallback stat if kind is unknown
+                const is_dir = if (entry.kind == .directory)
+                    true
+                else if (entry.kind == .unknown) blk: {
+                    // fallback: stat the entry to check if it's a directory
+                    const full_path = std.fs.path.join(self.allocator, &.{ search_dir, entry.name }) catch break :blk false;
+                    defer self.allocator.free(full_path);
+                    var d = std.fs.cwd().openDir(full_path, .{}) catch break :blk false;
+                    d.close();
+                    break :blk true;
+                } else false;
+
+                const full_name = if (is_dir)
                     try std.fmt.allocPrint(self.allocator, "{s}/", .{entry.name})
                 else
                     try self.allocator.dupe(u8, entry.name);
@@ -240,6 +262,10 @@ pub fn handleTabCompletion(self: *Shell) !void {
     }
 
     if (matches.items.len == 0) {
+        // if we inserted a slash for directory, still need to render
+        if (inserted_slash) {
+            try self.renderLine();
+        }
         return;
     } else if (matches.items.len == 1) {
         const match = matches.items[0];
@@ -247,7 +273,7 @@ pub fn handleTabCompletion(self: *Shell) !void {
         // escape special characters for shell
         const escaped = try escapeForShell(self.allocator, comp_str);
         defer self.allocator.free(escaped);
-        self.edit_buf.cursor = @intCast(word_end);
+        self.edit_buf.cursor = @intCast(effective_word_end);
         _ = self.edit_buf.insertSlice(escaped);
         // add trailing space for files (not directories)
         if (!std.mem.endsWith(u8, match, "/")) {
@@ -269,7 +295,7 @@ pub fn handleTabCompletion(self: *Shell) !void {
             // escape special characters for shell
             const escaped = try escapeForShell(self.allocator, comp_str);
             defer self.allocator.free(escaped);
-            self.edit_buf.cursor = @intCast(word_end);
+            self.edit_buf.cursor = @intCast(effective_word_end);
             const inserted = self.edit_buf.insertSlice(escaped);
             if (inserted > 0) {
                 try self.renderLine();
@@ -288,7 +314,7 @@ pub fn handleTabCompletion(self: *Shell) !void {
         self.completion_mode = true;
         self.completion_index = self.completion_matches.items.len;
         self.completion_word_start = word_result.start;
-        self.completion_word_end = word_end;
+        self.completion_word_end = effective_word_end;
         self.completion_original_len = self.edit_buf.len;
         self.completion_pattern_len = pattern.len;
 
