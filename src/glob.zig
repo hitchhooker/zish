@@ -92,8 +92,8 @@ fn expandRecursiveGlob(allocator: std.mem.Allocator, pattern: []const u8) ![][]c
     else
         ".";
 
-    // recursively walk directories
-    try walkRecursive(allocator, &results, start_dir, suffix);
+    // recursively walk directories (start at depth 0)
+    try walkRecursive(allocator, &results, start_dir, suffix, 0);
 
     // sort results
     std.mem.sort([]const u8, results.items, {}, stringLessThan);
@@ -101,12 +101,18 @@ fn expandRecursiveGlob(allocator: std.mem.Allocator, pattern: []const u8) ![][]c
     return try results.toOwnedSlice(allocator);
 }
 
+const MAX_GLOB_DEPTH: u8 = 32; // prevent runaway recursion
+
 fn walkRecursive(
     allocator: std.mem.Allocator,
     results: *std.ArrayList([]const u8),
     dir_path: []const u8,
     file_pattern: []const u8,
+    depth: u8,
 ) !void {
+    // depth limit to prevent stack overflow on deep/cyclic trees
+    if (depth >= MAX_GLOB_DEPTH) return;
+
     var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
 
@@ -120,9 +126,9 @@ fn walkRecursive(
             continue;
         }
 
+        // only recurse into real directories, skip symlinks to avoid loops
         if (entry.kind == .directory) {
-            // recurse into subdirectory
-            try walkRecursive(allocator, results, full_path, file_pattern);
+            try walkRecursive(allocator, results, full_path, file_pattern, depth + 1);
         }
 
         // check if file matches pattern
