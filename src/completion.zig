@@ -101,11 +101,44 @@ pub fn handleTabCompletion(self: *Shell) !void {
 
     // determine base directory and search pattern
     var expanded_dir_buf: [4096]u8 = undefined;
-    const search_dir: []const u8 = if (std.mem.lastIndexOf(u8, word, "/")) |last_slash| blk: {
+    var expanded_word_buf: [4096]u8 = undefined;
+
+    // check if word (without trailing /) is an existing directory
+    // if so, treat it as if it had trailing / to complete inside
+    const effective_word: []const u8 = blk: {
+        if (word.len == 0 or std.mem.endsWith(u8, word, "/")) break :blk word;
+
+        // expand ~ for directory check
+        const check_path: []const u8 = if (std.mem.startsWith(u8, word, "~")) inner: {
+            const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch break :blk word;
+            defer self.allocator.free(home);
+            const rest = word[1..];
+            if (home.len + rest.len < expanded_word_buf.len) {
+                @memcpy(expanded_word_buf[0..home.len], home);
+                @memcpy(expanded_word_buf[home.len..][0..rest.len], rest);
+                break :inner expanded_word_buf[0 .. home.len + rest.len];
+            }
+            break :blk word;
+        } else word;
+
+        // check if it's a directory
+        const stat = std.fs.cwd().statFile(check_path) catch break :blk word;
+        if (stat.kind == .directory) {
+            // it's a directory - append / conceptually
+            if (word.len + 1 < expanded_word_buf.len) {
+                @memcpy(expanded_word_buf[0..word.len], word);
+                expanded_word_buf[word.len] = '/';
+                break :blk expanded_word_buf[0 .. word.len + 1];
+            }
+        }
+        break :blk word;
+    };
+
+    const search_dir: []const u8 = if (std.mem.lastIndexOf(u8, effective_word, "/")) |last_slash| blk: {
         if (last_slash == 0) {
             break :blk "/";
         } else {
-            const dir_part = word[0..last_slash];
+            const dir_part = effective_word[0..last_slash];
             if (std.mem.startsWith(u8, dir_part, "~")) {
                 const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch break :blk dir_part;
                 defer self.allocator.free(home);
@@ -119,7 +152,7 @@ pub fn handleTabCompletion(self: *Shell) !void {
             }
             break :blk dir_part;
         }
-    } else if (std.mem.eql(u8, word, "~")) blk: {
+    } else if (std.mem.eql(u8, effective_word, "~")) blk: {
         const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch break :blk ".";
         defer self.allocator.free(home);
         if (home.len < expanded_dir_buf.len) {
@@ -129,12 +162,12 @@ pub fn handleTabCompletion(self: *Shell) !void {
         break :blk ".";
     } else ".";
 
-    const pattern = if (std.mem.lastIndexOf(u8, word, "/")) |last_slash|
-        word[last_slash + 1 ..]
-    else if (std.mem.eql(u8, word, "~"))
+    const pattern = if (std.mem.lastIndexOf(u8, effective_word, "/")) |last_slash|
+        effective_word[last_slash + 1 ..]
+    else if (std.mem.eql(u8, effective_word, "~"))
         ""
     else
-        word;
+        effective_word;
 
     // find matches
     var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 16);
