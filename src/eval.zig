@@ -7,6 +7,86 @@ const parser = @import("parser.zig");
 const builtins = @import("builtins.zig");
 const jobs = @import("jobs.zig");
 
+// ============ "did you mean?" typo suggestions ============
+
+// levenshtein distance for typo detection (stack-allocated, max 32 chars)
+fn levenshtein(a: []const u8, b: []const u8) usize {
+    if (a.len > 32 or b.len > 32) return 999;
+    if (a.len == 0) return b.len;
+    if (b.len == 0) return a.len;
+
+    var prev: [33]usize = undefined;
+    var curr: [33]usize = undefined;
+
+    for (0..b.len + 1) |i| prev[i] = i;
+
+    for (a, 0..) |ca, i| {
+        curr[0] = i + 1;
+        for (b, 0..) |cb, j| {
+            const cost: usize = if (ca == cb) 0 else 1;
+            curr[j + 1] = @min(@min(prev[j + 1] + 1, curr[j] + 1), prev[j] + cost);
+        }
+        @memcpy(prev[0 .. b.len + 1], curr[0 .. b.len + 1]);
+    }
+    return prev[b.len];
+}
+
+// find similar command and print suggestion
+fn suggestCommand(shell: *Shell, typo: []const u8) void {
+    var best_match: ?[]const u8 = null;
+    var best_dist: usize = 999;
+    const max_dist: usize = @max(2, typo.len / 3); // allow more typos for longer names
+
+    // check builtins
+    const builtin_names = [_][]const u8{
+        "cd", "pwd", "echo", "printf", "read", "test", "exit", "export",
+        "unset", "alias", "source", "eval", "exec", "type", "which",
+        "jobs", "fg", "bg", "wait", "kill", "trap", "set", "shift",
+        "pushd", "popd", "dirs", "history", "help", "time", "true", "false",
+    };
+    for (builtin_names) |cmd| {
+        const dist = levenshtein(typo, cmd);
+        if (dist < best_dist and dist <= max_dist) {
+            best_dist = dist;
+            best_match = cmd;
+        }
+    }
+
+    // check aliases
+    var alias_iter = shell.aliases.iterator();
+    while (alias_iter.next()) |entry| {
+        const dist = levenshtein(typo, entry.key_ptr.*);
+        if (dist < best_dist and dist <= max_dist) {
+            best_dist = dist;
+            best_match = entry.key_ptr.*;
+        }
+    }
+
+    // check PATH executables (sample common commands for speed)
+    const common_cmds = [_][]const u8{
+        "git", "ls", "cat", "grep", "find", "make", "vim", "nano",
+        "ssh", "scp", "curl", "wget", "tar", "zip", "unzip", "man",
+        "top", "htop", "ps", "kill", "sudo", "apt", "pacman", "yum",
+        "docker", "python", "python3", "node", "npm", "cargo", "zig",
+        "gcc", "clang", "go", "rustc", "java", "mvn", "gradle",
+        "systemctl", "journalctl", "mount", "umount", "df", "du",
+        "chmod", "chown", "mkdir", "rmdir", "rm", "cp", "mv", "ln",
+        "head", "tail", "less", "more", "sort", "uniq", "wc", "awk", "sed",
+    };
+    for (common_cmds) |cmd| {
+        const dist = levenshtein(typo, cmd);
+        if (dist < best_dist and dist <= max_dist) {
+            best_dist = dist;
+            best_match = cmd;
+        }
+    }
+
+    // print suggestion if found
+    if (best_match) |match| {
+        shell.stdout().print("       did you mean: {s}?\n", .{match}) catch {};
+    }
+}
+
 // Fast integer parsing for small numbers - SectorLambda-inspired
 // Optimized for the common case of small positive integers (loop counters, etc.)
 inline fn fastParseI64(s: []const u8) ?i64 {
@@ -900,6 +980,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         const code = std.posix.W.EXITSTATUS(result.status);
         if (code == 127) {
             try shell.stdout().print("zish: {s}: command not found\n", .{cmd_name});
+            suggestCommand(shell, cmd_name);
         }
         return code;
     } else if (std.posix.W.IFSIGNALED(result.status)) {
