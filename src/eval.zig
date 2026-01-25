@@ -34,6 +34,85 @@ inline fn fastParseI64(s: []const u8) ?i64 {
     return if (negative) -result else result;
 }
 
+// Clean up process substitution children - close fds and reap zombies
+fn cleanupProcessSubst(shell: *Shell) void {
+    for (0..shell.proc_subst_count) |i| {
+        if (shell.proc_subst_fds[i] >= 0) {
+            std.posix.close(shell.proc_subst_fds[i]);
+            shell.proc_subst_fds[i] = -1;
+        }
+        if (shell.proc_subst_pids[i] != 0) {
+            _ = std.posix.waitpid(shell.proc_subst_pids[i], std.posix.W.NOHANG);
+            shell.proc_subst_pids[i] = 0;
+        }
+    }
+    shell.proc_subst_count = 0;
+}
+
+// Process substitution: <(cmd) or >(cmd)
+// Returns /dev/fd/N path for the pipe endpoint, or null if not a process subst
+fn expandProcessSubst(shell: *Shell, arg: []const u8) !?[:0]const u8 {
+    const is_input = std.mem.startsWith(u8, arg, "<(") and std.mem.endsWith(u8, arg, ")");
+    const is_output = std.mem.startsWith(u8, arg, ">(") and std.mem.endsWith(u8, arg, ")");
+
+    if (!is_input and !is_output) return null;
+
+    // extract command between ( and )
+    const cmd = arg[2 .. arg.len - 1];
+    if (cmd.len == 0) return null;
+
+    // create pipe
+    const pipe_fds = std.posix.pipe() catch return null;
+
+    const pid = std.posix.fork() catch {
+        std.posix.close(pipe_fds[0]);
+        std.posix.close(pipe_fds[1]);
+        return null;
+    };
+
+    if (pid == 0) {
+        // child process - run command
+        shell.allocator = std.heap.page_allocator;
+
+        if (is_input) {
+            // <(cmd): redirect stdout to pipe write end
+            std.posix.dup2(pipe_fds[1], std.posix.STDOUT_FILENO) catch std.posix.exit(1);
+        } else {
+            // >(cmd): redirect stdin from pipe read end
+            std.posix.dup2(pipe_fds[0], std.posix.STDIN_FILENO) catch std.posix.exit(1);
+        }
+        std.posix.close(pipe_fds[0]);
+        std.posix.close(pipe_fds[1]);
+
+        // run command using /bin/sh for simplicity and safety
+        const cmd_z = shell.allocator.dupeZ(u8, cmd) catch std.posix.exit(1);
+        const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd_z.ptr, null };
+        std.posix.execvpeZ("/bin/sh", &argv, @ptrCast(std.os.environ.ptr)) catch {};
+        std.posix.exit(127);
+    }
+
+    // parent - close unused end and return /dev/fd/N
+    const fd: std.posix.fd_t = if (is_input) blk: {
+        std.posix.close(pipe_fds[1]); // close write end
+        break :blk pipe_fds[0]; // return read end
+    } else blk: {
+        std.posix.close(pipe_fds[0]); // close read end
+        break :blk pipe_fds[1]; // return write end
+    };
+
+    // track child for later cleanup (best effort)
+    shell.proc_subst_pids[shell.proc_subst_count] = pid;
+    shell.proc_subst_fds[shell.proc_subst_count] = fd;
+    if (shell.proc_subst_count < shell.proc_subst_pids.len - 1) {
+        shell.proc_subst_count += 1;
+    }
+
+    // return /dev/fd/N path
+    var buf: [32]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "/dev/fd/{d}", .{fd}) catch return null;
+    return try shell.allocator.dupeZ(u8, path);
+}
+
 // Build environment array merging system env with shell variables
 // Shell variables override system environment
 fn buildEnvironment(shell: *Shell) ![*:null]const ?[*:0]const u8 {
@@ -404,6 +483,9 @@ fn evaluateEchoBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
 pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len == 0) return 1;
 
+    // clean up any process substitution children when command finishes
+    defer cleanupProcessSubst(shell);
+
     const raw_cmd = node.children[0].value;
 
     // Fast path for simple builtins - no allocation needed
@@ -536,6 +618,12 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         // Skip brace expansion for single-quoted strings
         if (arg_node.node_type == .string) {
             try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, arg));
+            continue;
+        }
+
+        // Step 0: Process substitution <(cmd) or >(cmd)
+        if (expandProcessSubst(shell, arg) catch null) |proc_path| {
+            try expanded_args.append(shell.allocator, proc_path);
             continue;
         }
 

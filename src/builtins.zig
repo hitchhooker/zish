@@ -42,6 +42,8 @@ pub fn isBuiltin(name: []const u8) bool {
         "jobs", "fg", "bg", "wait", "kill", "disown", "trap",
         // shell control
         "exit", "return", "builtin", "command",
+        // benchmarking
+        "time",
         // zish specific (handled in eval.zig)
         "chpw",
     };
@@ -115,6 +117,9 @@ pub fn dispatch(shell: *Shell, cmd_name: []const u8, args: []const []const u8) !
     if (std.mem.eql(u8, cmd_name, "return")) return try returnCmd(shell, args);
     if (std.mem.eql(u8, cmd_name, "builtin")) return try builtinCmd(shell, args);
     if (std.mem.eql(u8, cmd_name, "command")) return try commandCmd(shell, args);
+
+    // benchmarking
+    if (std.mem.eql(u8, cmd_name, "time")) return try timeCmd(shell, args);
 
     // zish specific
     if (std.mem.eql(u8, cmd_name, "chpw")) return null; // handled in eval.zig for now (complex)
@@ -365,72 +370,351 @@ fn printf(shell: *Shell, args: []const []const u8) !u8 {
 
     const format = args[1];
     var arg_idx: usize = 2;
+    const writer = shell.stdout();
 
     var i: usize = 0;
     while (i < format.len) {
         if (format[i] == '\\' and i + 1 < format.len) {
-            switch (format[i + 1]) {
-                'n' => try shell.stdout().writeByte('\n'),
-                't' => try shell.stdout().writeByte('\t'),
-                'r' => try shell.stdout().writeByte('\r'),
-                '\\' => try shell.stdout().writeByte('\\'),
-                else => try shell.stdout().writeByte(format[i + 1]),
+            const escaped = printfParseEscape(format[i + 1 ..]);
+            try writer.writeByte(escaped.char);
+            i += 1 + escaped.len;
+        } else if (format[i] == '%') {
+            const spec = printfParseSpec(format[i..]);
+            if (spec.specifier == '%') {
+                try writer.writeByte('%');
+            } else {
+                const arg = if (arg_idx < args.len) args[arg_idx] else "";
+                if (arg_idx < args.len) arg_idx += 1;
+                try printfFormatArg(writer, spec, arg);
             }
-            i += 2;
-        } else if (format[i] == '%' and i + 1 < format.len) {
-            switch (format[i + 1]) {
-                's' => {
-                    if (arg_idx < args.len) {
-                        try shell.stdout().writeAll(args[arg_idx]);
-                        arg_idx += 1;
-                    }
-                    i += 2;
-                },
-                'd' => {
-                    if (arg_idx < args.len) {
-                        try shell.stdout().writeAll(args[arg_idx]);
-                        arg_idx += 1;
-                    }
-                    i += 2;
-                },
-                '%' => {
-                    try shell.stdout().writeByte('%');
-                    i += 2;
-                },
-                else => {
-                    try shell.stdout().writeByte(format[i]);
-                    i += 1;
-                },
-            }
+            i += spec.len;
         } else {
-            try shell.stdout().writeByte(format[i]);
+            try writer.writeByte(format[i]);
             i += 1;
         }
     }
     return 0;
 }
 
-fn read(shell: *Shell, args: []const []const u8) !u8 {
-    if (args.len < 2) {
-        try shell.stdout().writeAll("read: usage: read varname\n");
-        return 1;
-    }
+const PrintfSpec = struct {
+    specifier: u8,
+    width: ?usize = null,
+    precision: ?usize = null,
+    left_align: bool = false,
+    zero_pad: bool = false,
+    len: usize,
+};
 
-    const varname = args[1];
-    var buf: [4096]u8 = undefined;
-    var pos: usize = 0;
+fn printfParseSpec(fmt: []const u8) PrintfSpec {
+    if (fmt.len < 2 or fmt[0] != '%') return .{ .specifier = 0, .len = 1 };
 
-    // read char by char until newline
-    while (pos < buf.len - 1) {
-        var c: [1]u8 = undefined;
-        const n = std.posix.read(std.posix.STDIN_FILENO, &c) catch return 1;
-        if (n == 0) return 1; // EOF
-        if (c[0] == '\n') break;
-        buf[pos] = c[0];
+    var pos: usize = 1;
+    var left_align = false;
+    var zero_pad = false;
+
+    // flags
+    while (pos < fmt.len) {
+        switch (fmt[pos]) {
+            '-' => left_align = true,
+            '0' => if (!left_align) {
+                zero_pad = true;
+            },
+            '+', ' ', '#' => {},
+            else => break,
+        }
         pos += 1;
     }
 
-    try setVar(shell, varname, buf[0..pos]);
+    // width
+    var width: ?usize = null;
+    const width_start = pos;
+    while (pos < fmt.len and fmt[pos] >= '0' and fmt[pos] <= '9') : (pos += 1) {}
+    if (pos > width_start) {
+        width = std.fmt.parseInt(usize, fmt[width_start..pos], 10) catch null;
+    }
+
+    // precision
+    var precision: ?usize = null;
+    if (pos < fmt.len and fmt[pos] == '.') {
+        pos += 1;
+        const prec_start = pos;
+        while (pos < fmt.len and fmt[pos] >= '0' and fmt[pos] <= '9') : (pos += 1) {}
+        precision = std.fmt.parseInt(usize, fmt[prec_start..pos], 10) catch 0;
+    }
+
+    // specifier
+    const specifier: u8 = if (pos < fmt.len) fmt[pos] else 0;
+    if (specifier != 0) pos += 1;
+
+    return .{
+        .specifier = specifier,
+        .width = width,
+        .precision = precision,
+        .left_align = left_align,
+        .zero_pad = zero_pad,
+        .len = pos,
+    };
+}
+
+fn printfFormatArg(writer: anytype, spec: PrintfSpec, arg: []const u8) !void {
+    var buf: [64]u8 = undefined;
+    var output: []const u8 = "";
+
+    switch (spec.specifier) {
+        's' => {
+            output = if (spec.precision) |p| arg[0..@min(p, arg.len)] else arg;
+        },
+        'c' => {
+            if (arg.len > 0) {
+                // check if numeric
+                if (std.fmt.parseInt(u8, arg, 0)) |code| {
+                    buf[0] = code;
+                    output = buf[0..1];
+                } else |_| {
+                    output = arg[0..1];
+                }
+            }
+        },
+        'd', 'i' => {
+            const val = std.fmt.parseInt(i64, arg, 0) catch 0;
+            output = std.fmt.bufPrint(&buf, "{d}", .{val}) catch "";
+        },
+        'u' => {
+            const val = std.fmt.parseInt(u64, arg, 0) catch 0;
+            output = std.fmt.bufPrint(&buf, "{d}", .{val}) catch "";
+        },
+        'x' => {
+            const val = std.fmt.parseInt(u64, arg, 0) catch 0;
+            output = std.fmt.bufPrint(&buf, "{x}", .{val}) catch "";
+        },
+        'X' => {
+            const val = std.fmt.parseInt(u64, arg, 0) catch 0;
+            output = std.fmt.bufPrint(&buf, "{X}", .{val}) catch "";
+        },
+        'o' => {
+            const val = std.fmt.parseInt(u64, arg, 0) catch 0;
+            output = std.fmt.bufPrint(&buf, "{o}", .{val}) catch "";
+        },
+        'f', 'e', 'g' => {
+            const val = std.fmt.parseFloat(f64, arg) catch 0.0;
+            const prec = spec.precision orelse 6;
+            output = std.fmt.bufPrint(&buf, "{d:.6}", .{val}) catch blk: {
+                // manual precision handling
+                _ = prec;
+                break :blk "";
+            };
+        },
+        'b' => {
+            // string with backslash escapes interpreted
+            for (arg) |c| {
+                if (c == '\\') continue; // simplified - just print
+                try writer.writeByte(c);
+            }
+            return;
+        },
+        else => return,
+    }
+
+    // apply width padding
+    const width = spec.width orelse 0;
+    if (output.len >= width) {
+        try writer.writeAll(output);
+    } else {
+        const pad_len = width - output.len;
+        const pad_char: u8 = if (spec.zero_pad and !spec.left_align) '0' else ' ';
+        if (spec.left_align) {
+            try writer.writeAll(output);
+            for (0..pad_len) |_| try writer.writeByte(pad_char);
+        } else {
+            for (0..pad_len) |_| try writer.writeByte(pad_char);
+            try writer.writeAll(output);
+        }
+    }
+}
+
+const EscapeResult = struct { char: u8, len: usize };
+
+fn printfParseEscape(s: []const u8) EscapeResult {
+    if (s.len == 0) return .{ .char = '\\', .len = 0 };
+    return switch (s[0]) {
+        'n' => .{ .char = '\n', .len = 1 },
+        't' => .{ .char = '\t', .len = 1 },
+        'r' => .{ .char = '\r', .len = 1 },
+        'a' => .{ .char = 0x07, .len = 1 },
+        'b' => .{ .char = 0x08, .len = 1 },
+        'f' => .{ .char = 0x0c, .len = 1 },
+        'v' => .{ .char = 0x0b, .len = 1 },
+        '\\' => .{ .char = '\\', .len = 1 },
+        '0' => blk: {
+            // octal \0nnn
+            var val: u8 = 0;
+            var len: usize = 1;
+            while (len < 4 and len < s.len and s[len] >= '0' and s[len] <= '7') : (len += 1) {
+                val = val *| 8 +| (s[len] - '0');
+            }
+            break :blk .{ .char = val, .len = len };
+        },
+        'x' => blk: {
+            // hex \xNN
+            if (s.len >= 3) {
+                if (std.fmt.parseInt(u8, s[1..3], 16)) |val| {
+                    break :blk .{ .char = val, .len = 3 };
+                } else |_| {}
+            }
+            break :blk .{ .char = 'x', .len = 1 };
+        },
+        else => .{ .char = s[0], .len = 1 },
+    };
+}
+
+fn read(shell: *Shell, args: []const []const u8) !u8 {
+    // parse options
+    var prompt: ?[]const u8 = null;
+    var timeout_secs: ?u32 = null;
+    var nchars: ?usize = null;
+    var silent = false;
+    var raw = false;
+    var varnames_start: usize = 1;
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (arg.len == 0 or arg[0] != '-') break;
+
+        if (std.mem.eql(u8, arg, "-p")) {
+            i += 1;
+            if (i >= args.len) {
+                try shell.stdout().writeAll("read: -p requires prompt string\n");
+                return 1;
+            }
+            prompt = args[i];
+        } else if (std.mem.eql(u8, arg, "-t")) {
+            i += 1;
+            if (i >= args.len) {
+                try shell.stdout().writeAll("read: -t requires timeout\n");
+                return 1;
+            }
+            timeout_secs = std.fmt.parseInt(u32, args[i], 10) catch {
+                try shell.stdout().writeAll("read: invalid timeout\n");
+                return 1;
+            };
+        } else if (std.mem.eql(u8, arg, "-n")) {
+            i += 1;
+            if (i >= args.len) {
+                try shell.stdout().writeAll("read: -n requires count\n");
+                return 1;
+            }
+            nchars = std.fmt.parseInt(usize, args[i], 10) catch {
+                try shell.stdout().writeAll("read: invalid count\n");
+                return 1;
+            };
+        } else if (std.mem.eql(u8, arg, "-s")) {
+            silent = true;
+        } else if (std.mem.eql(u8, arg, "-r")) {
+            raw = true;
+        } else if (std.mem.eql(u8, arg, "--")) {
+            i += 1;
+            break;
+        } else {
+            break; // not an option, must be varname
+        }
+        varnames_start = i + 1;
+    }
+
+    // need at least one variable name
+    if (varnames_start >= args.len) {
+        // default to REPLY if no varname given
+        varnames_start = args.len;
+    }
+
+    // display prompt if given
+    if (prompt) |p| {
+        try shell.stdout().writeAll(p);
+        shell.stdout().flush() catch {};
+    }
+
+    const stdin_fd = std.posix.STDIN_FILENO;
+
+    // save terminal state for silent mode
+    var orig_termios: ?std.posix.termios = null;
+    if (silent and std.posix.isatty(stdin_fd)) {
+        orig_termios = std.posix.tcgetattr(stdin_fd) catch null;
+        if (orig_termios) |ot| {
+            var new_termios = ot;
+            new_termios.lflag.ECHO = false;
+            std.posix.tcsetattr(stdin_fd, .NOW, new_termios) catch {};
+        }
+    }
+    defer {
+        if (orig_termios) |ot| {
+            std.posix.tcsetattr(stdin_fd, .NOW, ot) catch {};
+            // print newline since echo was off
+            _ = std.posix.write(std.posix.STDOUT_FILENO, "\n") catch {};
+        }
+    }
+
+    var buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+    const max_chars = nchars orelse (buf.len - 1);
+
+    // set up timeout using poll
+    const timeout_ms: i32 = if (timeout_secs) |t| @intCast(t * 1000) else -1;
+
+    while (pos < max_chars) {
+        // use poll for timeout support
+        var fds = [_]std.posix.pollfd{.{
+            .fd = stdin_fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+
+        const poll_result = std.posix.poll(&fds, timeout_ms) catch return 1;
+        if (poll_result == 0) {
+            // timeout
+            return 1;
+        }
+
+        var c: [1]u8 = undefined;
+        const n = std.posix.read(stdin_fd, &c) catch return 1;
+        if (n == 0) break; // EOF
+
+        // handle newline (end of input unless -n specified)
+        if (c[0] == '\n') {
+            if (nchars == null) break;
+            buf[pos] = c[0];
+            pos += 1;
+            continue;
+        }
+
+        // handle backslash escapes (unless -r)
+        if (!raw and c[0] == '\\' and pos < max_chars) {
+            // read next char
+            const n2 = std.posix.read(stdin_fd, &c) catch break;
+            if (n2 == 0) break;
+            // in non-raw mode, backslash-newline continues line
+            if (c[0] == '\n') continue;
+            // otherwise keep the escaped char
+        }
+
+        buf[pos] = c[0];
+        pos += 1;
+
+        // if -n specified and we hit the count, stop
+        if (nchars != null and pos >= max_chars) break;
+    }
+
+    const value = buf[0..pos];
+
+    // assign to variable(s)
+    if (varnames_start < args.len) {
+        // single variable gets whole line
+        try setVar(shell, args[varnames_start], value);
+        // TODO: multiple variables split on IFS
+    } else {
+        // no variable specified, use REPLY
+        try setVar(shell, "REPLY", value);
+    }
+
     return 0;
 }
 
@@ -1375,9 +1659,86 @@ fn disown(shell: *Shell, args: []const []const u8) !u8 {
 }
 
 fn trap(shell: *Shell, args: []const []const u8) !u8 {
-    _ = args;
-    try shell.stdout().writeAll("trap: not implemented\n");
-    return 1;
+    const TrapTable = Shell.TrapTable;
+
+    // trap (no args) - list all traps
+    if (args.len == 1) {
+        inline for (std.meta.fields(TrapTable.Signal)) |field| {
+            const sig: TrapTable.Signal = @enumFromInt(field.value);
+            if (shell.traps.get(sig)) |cmd| {
+                try shell.stdout().print("trap -- '{s}' {s}\n", .{ cmd, field.name });
+            }
+        }
+        return 0;
+    }
+
+    // trap -l - list signal names
+    if (args.len == 2 and std.mem.eql(u8, args[1], "-l")) {
+        var col: usize = 0;
+        inline for (std.meta.fields(TrapTable.Signal)) |field| {
+            try shell.stdout().print("{d:>2}) SIG{s:<8}", .{ field.value, field.name });
+            col += 1;
+            if (col % 4 == 0) {
+                try shell.stdout().writeAll("\n");
+            }
+        }
+        if (col % 4 != 0) try shell.stdout().writeAll("\n");
+        return 0;
+    }
+
+    // trap -p [signals...] - print traps for specific signals
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "-p")) {
+        if (args.len == 2) {
+            // print all traps (same as no args)
+            inline for (std.meta.fields(TrapTable.Signal)) |field| {
+                const sig: TrapTable.Signal = @enumFromInt(field.value);
+                if (shell.traps.get(sig)) |cmd| {
+                    try shell.stdout().print("trap -- '{s}' {s}\n", .{ cmd, field.name });
+                }
+            }
+        } else {
+            // print specific signals
+            for (args[2..]) |sig_name| {
+                if (TrapTable.Signal.fromName(sig_name)) |sig| {
+                    if (shell.traps.get(sig)) |cmd| {
+                        try shell.stdout().print("trap -- '{s}' {s}\n", .{ cmd, @tagName(sig) });
+                    }
+                } else {
+                    try shell.stdout().print("trap: {s}: invalid signal\n", .{sig_name});
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    }
+
+    // trap cmd signal [signal...]
+    // trap '' signal - ignore signal
+    // trap - signal - reset to default
+    if (args.len < 3) {
+        try shell.stdout().writeAll("trap: usage: trap [-lp] [cmd] [signal ...]\n");
+        return 1;
+    }
+
+    const cmd_arg = args[1];
+
+    // handle reset case: trap - SIGNAL
+    const cmd: ?[]const u8 = if (std.mem.eql(u8, cmd_arg, "-"))
+        null
+    else
+        cmd_arg;
+
+    // set trap for each signal
+    for (args[2..]) |sig_name| {
+        if (TrapTable.Signal.fromName(sig_name)) |sig| {
+            try shell.traps.set(shell.allocator, sig, cmd);
+        } else {
+            try shell.stdout().print("trap: {s}: invalid signal\n", .{sig_name});
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 // ============ shell control ============
@@ -1387,6 +1748,9 @@ fn exit(shell: *Shell, args: []const []const u8) !u8 {
         std.fmt.parseInt(u8, args[1], 10) catch 0
     else
         shell.last_exit_code;
+
+    // run EXIT trap before exiting
+    shell.runExitTrap();
 
     shell.running = false;
     return code;
@@ -1415,6 +1779,494 @@ fn commandCmd(shell: *Shell, args: []const []const u8) !u8 {
     _ = shell;
     _ = args;
     return 127; // fall through to external command
+}
+
+// ============ time builtin - criterion-style benchmarking ============
+
+// rusage struct for Linux (matches kernel definition)
+const Rusage = extern struct {
+    ru_utime: std.posix.timeval, // user time
+    ru_stime: std.posix.timeval, // system time
+    ru_maxrss: isize, // max resident set size (KB on Linux)
+    ru_ixrss: isize,
+    ru_idrss: isize,
+    ru_isrss: isize,
+    ru_minflt: isize, // page faults not requiring I/O
+    ru_majflt: isize, // page faults requiring I/O
+    ru_nswap: isize,
+    ru_inblock: isize,
+    ru_oublock: isize,
+    ru_msgsnd: isize,
+    ru_msgrcv: isize,
+    ru_nsignals: isize,
+    ru_nvcsw: isize, // voluntary context switches
+    ru_nivcsw: isize, // involuntary context switches
+};
+
+// wait4 syscall - like waitpid but returns rusage
+fn wait4(pid: std.posix.pid_t, status: *u32, options: u32, rusage: ?*Rusage) std.posix.pid_t {
+    const ret = std.os.linux.syscall4(
+        .wait4,
+        @bitCast(@as(isize, pid)),
+        @intFromPtr(status),
+        options,
+        @intFromPtr(rusage),
+    );
+    return @truncate(@as(isize, @bitCast(ret)));
+}
+
+const BenchSample = struct {
+    wall_ns: i128,
+    user_ns: i128,
+    sys_ns: i128,
+    maxrss_kb: isize,
+    exit_code: u8,
+};
+
+fn timeCmd(shell: *Shell, args: []const []const u8) !u8 {
+    const writer = shell.stdout();
+
+    // parse options
+    var iterations: usize = 1;
+    var warmup: usize = 0;
+    var show_histogram = false;
+    var quiet = false;
+    var verbose = false;
+    var cmd_start: usize = 1;
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (arg.len == 0 or arg[0] != '-') break;
+
+        if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--iterations")) {
+            i += 1;
+            if (i >= args.len) {
+                try writer.writeAll("time: -n requires iteration count\n");
+                return 1;
+            }
+            iterations = std.fmt.parseInt(usize, args[i], 10) catch {
+                try writer.writeAll("time: invalid iteration count\n");
+                return 1;
+            };
+            iterations = @max(1, @min(iterations, 10000));
+        } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--warmup")) {
+            i += 1;
+            if (i >= args.len) {
+                try writer.writeAll("time: -w requires warmup count\n");
+                return 1;
+            }
+            warmup = std.fmt.parseInt(usize, args[i], 10) catch {
+                try writer.writeAll("time: invalid warmup count\n");
+                return 1;
+            };
+            warmup = @min(warmup, 100);
+        } else if (std.mem.eql(u8, arg, "-H") or std.mem.eql(u8, arg, "--histogram")) {
+            show_histogram = true;
+        } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "--quiet")) {
+            quiet = true;
+        } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+            verbose = true;
+        } else if (std.mem.eql(u8, arg, "--help")) {
+            try writer.writeAll(
+                \\time - command timing and benchmarking
+                \\
+                \\usage: time [options] command [args...]
+                \\
+                \\options:
+                \\  -v, --verbose        show detailed stats (memory, etc.)
+                \\  -n, --iterations N   benchmark with N iterations
+                \\  -w, --warmup W       run W warmup iterations first
+                \\  -H, --histogram      show timing distribution
+                \\  -q, --quiet          minimal output (just time)
+                \\      --help           show this help
+                \\
+                \\examples:
+                \\  time ls              basic timing (bash-style)
+                \\  time -v ls           verbose with memory stats
+                \\  time -n 100 ls       benchmark with statistics
+                \\  time -n 50 -w 5 cmd  benchmark with warmup
+                \\
+            );
+            return 0;
+        } else if (std.mem.eql(u8, arg, "--")) {
+            i += 1;
+            break;
+        } else {
+            break;
+        }
+        cmd_start = i + 1;
+    }
+
+    if (cmd_start >= args.len) {
+        try writer.writeAll("time: no command specified\n");
+        return 1;
+    }
+
+    const cmd_args = args[cmd_start..];
+    const is_benchmark = iterations > 1;
+
+    // run warmup iterations
+    for (0..warmup) |_| {
+        _ = try runTimedCommand(shell, cmd_args);
+    }
+
+    // collect samples
+    var samples: [10000]BenchSample = undefined;
+    var last_exit: u8 = 0;
+
+    for (0..iterations) |iter| {
+        samples[iter] = try runTimedCommand(shell, cmd_args);
+        last_exit = samples[iter].exit_code;
+    }
+
+    // compute statistics
+    const stats = computeStats(samples[0..iterations]);
+
+    // output results
+    if (is_benchmark) {
+        try printBenchmarkResults(writer, stats, iterations, quiet, show_histogram, samples[0..iterations]);
+    } else {
+        try printSingleResult(writer, samples[0], quiet, verbose);
+    }
+
+    return last_exit;
+}
+
+fn runTimedCommand(shell: *Shell, cmd_args: []const []const u8) !BenchSample {
+    const start = std.time.nanoTimestamp();
+
+    // fork and run command
+    const pid = std.posix.fork() catch return BenchSample{
+        .wall_ns = 0,
+        .user_ns = 0,
+        .sys_ns = 0,
+        .maxrss_kb = 0,
+        .exit_code = 127,
+    };
+
+    if (pid == 0) {
+        // child - exec the command
+        var argv_buf: [256]?[*:0]const u8 = undefined;
+        for (cmd_args, 0..) |arg, i| {
+            const arg_z = shell.allocator.dupeZ(u8, arg) catch std.posix.exit(127);
+            argv_buf[i] = arg_z.ptr;
+        }
+        argv_buf[cmd_args.len] = null;
+
+        const argv = argv_buf[0..cmd_args.len :null];
+        std.posix.execvpeZ(argv[0].?, argv, @ptrCast(std.os.environ.ptr)) catch {};
+        std.posix.exit(127);
+    }
+
+    // parent - wait for child with rusage via wait4
+    var status: u32 = 0;
+    var rusage: Rusage = std.mem.zeroes(Rusage);
+    _ = wait4(pid, &status, 0, &rusage);
+    const end = std.time.nanoTimestamp();
+
+    const wall_ns = end - start;
+    const user_ns = timevalToNs(rusage.ru_utime);
+    const sys_ns = timevalToNs(rusage.ru_stime);
+
+    const exit_code: u8 = if (std.posix.W.IFEXITED(status))
+        std.posix.W.EXITSTATUS(status)
+    else if (std.posix.W.IFSIGNALED(status))
+        128 + @as(u8, @truncate(@as(u32, @intCast(std.posix.W.TERMSIG(status)))))
+    else
+        1;
+
+    return BenchSample{
+        .wall_ns = wall_ns,
+        .user_ns = user_ns,
+        .sys_ns = sys_ns,
+        .maxrss_kb = rusage.ru_maxrss,
+        .exit_code = exit_code,
+    };
+}
+
+fn timevalToNs(tv: std.posix.timeval) i128 {
+    return @as(i128, tv.sec) * 1_000_000_000 + @as(i128, tv.usec) * 1000;
+}
+
+const BenchStats = struct {
+    mean_ns: f64,
+    median_ns: f64,
+    stddev_ns: f64,
+    min_ns: f64,
+    max_ns: f64,
+    p5_ns: f64,
+    p95_ns: f64,
+    outliers_low: usize,
+    outliers_high: usize,
+    mean_user_ns: f64,
+    mean_sys_ns: f64,
+    max_rss_kb: isize,
+};
+
+fn computeStats(samples: []const BenchSample) BenchStats {
+    if (samples.len == 0) {
+        return std.mem.zeroes(BenchStats);
+    }
+
+    // extract wall times and sort
+    var times: [10000]f64 = undefined;
+    var sum: f64 = 0;
+    var user_sum: f64 = 0;
+    var sys_sum: f64 = 0;
+    var max_rss: isize = 0;
+
+    for (samples, 0..) |s, i| {
+        times[i] = @floatFromInt(s.wall_ns);
+        sum += times[i];
+        user_sum += @as(f64, @floatFromInt(s.user_ns));
+        sys_sum += @as(f64, @floatFromInt(s.sys_ns));
+        if (s.maxrss_kb > max_rss) max_rss = s.maxrss_kb;
+    }
+
+    const n = samples.len;
+    const nf: f64 = @floatFromInt(n);
+
+    // sort for percentiles
+    std.mem.sort(f64, times[0..n], {}, std.sort.asc(f64));
+
+    const mean = sum / nf;
+    const median = if (n % 2 == 0)
+        (times[n / 2 - 1] + times[n / 2]) / 2.0
+    else
+        times[n / 2];
+
+    // stddev
+    var variance_sum: f64 = 0;
+    for (times[0..n]) |t| {
+        const diff = t - mean;
+        variance_sum += diff * diff;
+    }
+    const stddev = @sqrt(variance_sum / nf);
+
+    // percentiles
+    const p5_idx = @min(n - 1, @as(usize, @intFromFloat(nf * 0.05)));
+    const p95_idx = @min(n - 1, @as(usize, @intFromFloat(nf * 0.95)));
+
+    // outlier detection using IQR
+    const q1_idx = @as(usize, @intFromFloat(nf * 0.25));
+    const q3_idx = @min(n - 1, @as(usize, @intFromFloat(nf * 0.75)));
+    const q1 = times[q1_idx];
+    const q3 = times[q3_idx];
+    const iqr = q3 - q1;
+    const low_fence = q1 - 1.5 * iqr;
+    const high_fence = q3 + 1.5 * iqr;
+
+    var outliers_low: usize = 0;
+    var outliers_high: usize = 0;
+    for (times[0..n]) |t| {
+        if (t < low_fence) outliers_low += 1;
+        if (t > high_fence) outliers_high += 1;
+    }
+
+    return BenchStats{
+        .mean_ns = mean,
+        .median_ns = median,
+        .stddev_ns = stddev,
+        .min_ns = times[0],
+        .max_ns = times[n - 1],
+        .p5_ns = times[p5_idx],
+        .p95_ns = times[p95_idx],
+        .outliers_low = outliers_low,
+        .outliers_high = outliers_high,
+        .mean_user_ns = user_sum / nf,
+        .mean_sys_ns = sys_sum / nf,
+        .max_rss_kb = max_rss,
+    };
+}
+
+fn printSingleResult(writer: anytype, sample: BenchSample, quiet: bool, verbose: bool) !void {
+    const wall_s = @as(f64, @floatFromInt(sample.wall_ns)) / 1_000_000_000.0;
+    const user_s = @as(f64, @floatFromInt(sample.user_ns)) / 1_000_000_000.0;
+    const sys_s = @as(f64, @floatFromInt(sample.sys_ns)) / 1_000_000_000.0;
+
+    if (quiet) {
+        try writer.print("{d:.3}s\n", .{wall_s});
+        return;
+    }
+
+    if (verbose) {
+        // bash-style multiline
+        try writer.print("\nreal\t{d}m{d:.3}s\n", .{
+            @as(u32, @intFromFloat(wall_s / 60.0)),
+            @mod(wall_s, 60.0),
+        });
+        try writer.print("user\t{d}m{d:.3}s\n", .{
+            @as(u32, @intFromFloat(user_s / 60.0)),
+            @mod(user_s, 60.0),
+        });
+        try writer.print("sys\t{d}m{d:.3}s\n", .{
+            @as(u32, @intFromFloat(sys_s / 60.0)),
+            @mod(sys_s, 60.0),
+        });
+        if (sample.maxrss_kb > 0) {
+            try writer.print("mem\t{d} KB\n", .{sample.maxrss_kb});
+        }
+        return;
+    }
+
+    // zsh-style one-liner with memory
+    try writer.print("{d:.2}s user {d:.2}s sys {d} KB {d:.3}s total\n", .{
+        user_s,
+        sys_s,
+        sample.maxrss_kb,
+        wall_s,
+    });
+}
+
+fn printBenchmarkResults(writer: anytype, stats: BenchStats, n: usize, quiet: bool, show_histogram: bool, samples: []const BenchSample) !void {
+    if (quiet) {
+        try writer.print("{d:.3}ms ± {d:.3}ms\n", .{
+            stats.mean_ns / 1_000_000.0,
+            stats.stddev_ns / 1_000_000.0,
+        });
+        return;
+    }
+
+    try writer.writeAll("\n");
+    try writer.print("  benchmark: {d} iterations\n", .{n});
+    try writer.writeAll("  ─────────────────────────────────────\n");
+
+    // main timing stats
+    try writer.print("  mean:    {s}  ± {s}\n", .{
+        formatDuration(stats.mean_ns),
+        formatDuration(stats.stddev_ns),
+    });
+    try writer.print("  median:  {s}\n", .{formatDuration(stats.median_ns)});
+    try writer.print("  range:   {s} ... {s}\n", .{
+        formatDuration(stats.min_ns),
+        formatDuration(stats.max_ns),
+    });
+    try writer.print("  p5/p95:  {s} ... {s}\n", .{
+        formatDuration(stats.p5_ns),
+        formatDuration(stats.p95_ns),
+    });
+
+    // outliers
+    const total_outliers = stats.outliers_low + stats.outliers_high;
+    if (total_outliers > 0) {
+        const pct = @as(f64, @floatFromInt(total_outliers)) / @as(f64, @floatFromInt(n)) * 100.0;
+        try writer.print("  outliers: {d} ({d:.1}%)", .{ total_outliers, pct });
+        if (stats.outliers_low > 0 and stats.outliers_high > 0) {
+            try writer.print(" [{d} low, {d} high]", .{ stats.outliers_low, stats.outliers_high });
+        }
+        try writer.writeAll("\n");
+    }
+
+    try writer.writeAll("  ─────────────────────────────────────\n");
+
+    // resource usage
+    try writer.print("  user:    {s}  (mean)\n", .{formatDuration(stats.mean_user_ns)});
+    try writer.print("  sys:     {s}  (mean)\n", .{formatDuration(stats.mean_sys_ns)});
+    if (stats.max_rss_kb > 0) {
+        try writer.print("  mem:     {d} KB  (peak)\n", .{stats.max_rss_kb});
+    }
+
+    // throughput
+    if (stats.mean_ns > 0) {
+        const ops_per_sec = 1_000_000_000.0 / stats.mean_ns;
+        if (ops_per_sec >= 1.0) {
+            try writer.print("  throughput: {d:.2} ops/sec\n", .{ops_per_sec});
+        }
+    }
+
+    // histogram
+    if (show_histogram and n >= 5) {
+        try writer.writeAll("\n  distribution:\n");
+        try printHistogram(writer, samples);
+    }
+
+    try writer.writeAll("\n");
+}
+
+fn printHistogram(writer: anytype, samples: []const BenchSample) !void {
+    if (samples.len < 2) return;
+
+    // find min/max
+    var min_ns: i128 = samples[0].wall_ns;
+    var max_ns: i128 = samples[0].wall_ns;
+    for (samples) |s| {
+        if (s.wall_ns < min_ns) min_ns = s.wall_ns;
+        if (s.wall_ns > max_ns) max_ns = s.wall_ns;
+    }
+
+    if (min_ns == max_ns) {
+        try writer.writeAll("  [all samples identical]\n");
+        return;
+    }
+
+    // create buckets
+    const num_buckets: usize = 10;
+    var buckets: [10]usize = [_]usize{0} ** 10;
+    const range: f64 = @floatFromInt(max_ns - min_ns);
+    const bucket_size = range / @as(f64, @floatFromInt(num_buckets));
+
+    for (samples) |s| {
+        const offset: f64 = @floatFromInt(s.wall_ns - min_ns);
+        var bucket_idx = @as(usize, @intFromFloat(offset / bucket_size));
+        bucket_idx = @min(bucket_idx, num_buckets - 1);
+        buckets[bucket_idx] += 1;
+    }
+
+    // find max bucket for scaling
+    var max_count: usize = 1;
+    for (buckets) |count| {
+        if (count > max_count) max_count = count;
+    }
+
+    // print histogram
+    const bar_chars = "▏▎▍▌▋▊▉█";
+    const max_bar_width: usize = 30;
+
+    for (buckets, 0..) |count, bi| {
+        const bucket_start = min_ns + @as(i128, @intFromFloat(@as(f64, @floatFromInt(bi)) * bucket_size));
+        const bucket_end = min_ns + @as(i128, @intFromFloat(@as(f64, @floatFromInt(bi + 1)) * bucket_size));
+
+        // left label
+        try writer.print("  {s:>8} │", .{formatDuration(@floatFromInt(bucket_start))});
+
+        // bar
+        const bar_width = (count * max_bar_width) / max_count;
+        const remainder = ((count * max_bar_width * 8) / max_count) % 8;
+
+        for (0..bar_width) |_| {
+            try writer.writeAll("█");
+        }
+        if (remainder > 0 and bar_width < max_bar_width) {
+            const partial_idx = (remainder - 1) * 3;
+            try writer.writeAll(bar_chars[partial_idx .. partial_idx + 3]);
+        }
+
+        // right padding and count
+        const spaces_needed = max_bar_width - bar_width - @min(@as(usize, 1), if (remainder > 0) @as(usize, 1) else @as(usize, 0));
+        for (0..spaces_needed) |_| {
+            try writer.writeAll(" ");
+        }
+
+        try writer.print(" {d}\n", .{count});
+        _ = bucket_end;
+    }
+}
+
+fn formatDuration(ns: f64) [12]u8 {
+    var buf: [12]u8 = undefined;
+    @memset(&buf, ' ');
+
+    if (ns < 1_000) {
+        _ = std.fmt.bufPrint(&buf, "{d:>7.1} ns", .{ns}) catch {};
+    } else if (ns < 1_000_000) {
+        _ = std.fmt.bufPrint(&buf, "{d:>7.2} µs", .{ns / 1_000.0}) catch {};
+    } else if (ns < 1_000_000_000) {
+        _ = std.fmt.bufPrint(&buf, "{d:>7.2} ms", .{ns / 1_000_000.0}) catch {};
+    } else {
+        _ = std.fmt.bufPrint(&buf, "{d:>7.3} s ", .{ns / 1_000_000_000.0}) catch {};
+    }
+    return buf;
 }
 
 // ============ helpers ============

@@ -40,6 +40,108 @@ const CTRL_Z = input_mod.CTRL_Z;
 // to avoid data races between main thread and signal handlers
 var global_shell: @TypeOf(@as(?*Shell, null)) = null;
 
+// Trap table for signal handlers
+// Signals 1-31 are real signals, 0 is EXIT pseudo-signal
+pub const TrapTable = struct {
+    // trap commands indexed by signal number (0=EXIT, 1=HUP, 2=INT, etc.)
+    // null = default behavior, empty string = ignore, other = command to run
+    handlers: [32]?[]const u8 = [_]?[]const u8{null} ** 32,
+    allocator: ?std.mem.Allocator = null,
+
+    pub const Signal = enum(u8) {
+        EXIT = 0,
+        HUP = 1,
+        INT = 2,
+        QUIT = 3,
+        ILL = 4,
+        TRAP = 5,
+        ABRT = 6,
+        BUS = 7,
+        FPE = 8,
+        KILL = 9,
+        USR1 = 10,
+        SEGV = 11,
+        USR2 = 12,
+        PIPE = 13,
+        ALRM = 14,
+        TERM = 15,
+        CHLD = 17,
+        CONT = 18,
+        STOP = 19,
+        TSTP = 20,
+        TTIN = 21,
+        TTOU = 22,
+        URG = 23,
+        XCPU = 24,
+        XFSZ = 25,
+        VTALRM = 26,
+        PROF = 27,
+        WINCH = 28,
+        IO = 29,
+        PWR = 30,
+        SYS = 31,
+
+        pub fn fromName(sig_str: []const u8) ?Signal {
+            const upper = blk: {
+                var buf: [16]u8 = undefined;
+                if (sig_str.len > 16) break :blk sig_str;
+                for (sig_str, 0..) |c, i| {
+                    buf[i] = std.ascii.toUpper(c);
+                }
+                break :blk buf[0..sig_str.len];
+            };
+            // strip SIG prefix if present
+            const sig_name = if (std.mem.startsWith(u8, upper, "SIG")) upper[3..] else upper;
+
+            inline for (std.meta.fields(Signal)) |field| {
+                if (std.mem.eql(u8, sig_name, field.name)) {
+                    return @enumFromInt(field.value);
+                }
+            }
+            // try parsing as number
+            const num = std.fmt.parseInt(u8, sig_str, 10) catch return null;
+            if (num < 32) return @enumFromInt(num);
+            return null;
+        }
+
+        pub fn name(self: Signal) []const u8 {
+            return @tagName(self);
+        }
+    };
+
+    pub fn set(self: *TrapTable, allocator: std.mem.Allocator, sig: Signal, cmd: ?[]const u8) !void {
+        self.allocator = allocator;
+        const idx = @intFromEnum(sig);
+
+        // free old handler
+        if (self.handlers[idx]) |old| {
+            allocator.free(old);
+        }
+
+        // set new handler
+        if (cmd) |c| {
+            self.handlers[idx] = try allocator.dupe(u8, c);
+        } else {
+            self.handlers[idx] = null;
+        }
+    }
+
+    pub fn get(self: *const TrapTable, sig: Signal) ?[]const u8 {
+        return self.handlers[@intFromEnum(sig)];
+    }
+
+    pub fn deinit(self: *TrapTable) void {
+        if (self.allocator) |allocator| {
+            for (&self.handlers) |*h| {
+                if (h.*) |cmd| {
+                    allocator.free(cmd);
+                    h.* = null;
+                }
+            }
+        }
+    }
+};
+
 // ansi color codes for zsh-like colorful prompt
 const Colors = struct {
     const default_color = tty.Color.reset;
@@ -60,6 +162,7 @@ aliases: std.StringHashMap([]const u8),
 variables: std.StringHashMap([]const u8),
 arrays: std.StringHashMap(std.ArrayListUnmanaged([]const u8)), // array variables
 functions: std.StringHashMap(*const ast.AstNode), // name -> body AST
+traps: TrapTable = .{}, // signal handlers
 last_exit_code: u8 = 0,
 
 // shell options (set -e, -u, -x, -o pipefail)
@@ -69,6 +172,10 @@ opt_xtrace: bool = false, // -x: print commands before execution
 opt_pipefail: bool = false, // pipefail: pipeline fails if any command fails
 // when true, external commands exec directly instead of fork+exec (for pipeline children)
 in_pipeline: bool = false,
+// process substitution tracking
+proc_subst_pids: [16]std.posix.pid_t = [_]std.posix.pid_t{0} ** 16,
+proc_subst_fds: [16]std.posix.fd_t = [_]std.posix.fd_t{-1} ** 16,
+proc_subst_count: usize = 0,
 // job control
 job_table: jobs.JobTable,
 
@@ -246,6 +353,9 @@ pub fn deinit(self: *Shell) void {
 
     // cleanup job table
     self.job_table.deinit();
+
+    // cleanup traps
+    self.traps.deinit();
 
     self.allocator.free(self.clipboard);
     self.allocator.free(self.search_buffer);
@@ -1703,6 +1813,19 @@ pub fn executeCommand(self: *Shell, command: []const u8) !u8 {
     const exit_code = try self.executeCommandInternal(trimmed);
     self.last_exit_code = exit_code;
     return exit_code;
+}
+
+/// Execute a trap handler for a signal
+pub fn executeTrap(self: *Shell, sig: TrapTable.Signal) void {
+    if (self.traps.get(sig)) |cmd| {
+        if (cmd.len == 0) return; // empty string = ignore
+        _ = self.executeCommand(cmd) catch {};
+    }
+}
+
+/// Run EXIT trap (call before shell exits)
+pub fn runExitTrap(self: *Shell) void {
+    self.executeTrap(TrapTable.Signal.EXIT);
 }
 
 // ============ Array operations ============

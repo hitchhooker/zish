@@ -320,6 +320,16 @@ pub const Parser = struct {
                         try words.append(self.builder.arena.allocator(), word);
                     }
                 },
+                // process substitution <(cmd) or >(cmd)
+                .ProcessSubstIn, .ProcessSubstOut => {
+                    const token = self.current_token;
+                    // store with marker prefix so eval can identify it
+                    const prefix: []const u8 = if (token.ty == .ProcessSubstIn) "<(" else ">(";
+                    const marked = try std.fmt.allocPrint(self.builder.arena.allocator(), "{s}{s})", .{ prefix, token.value });
+                    const word = try self.builder.createword(marked, token.line, token.column);
+                    try words.append(self.builder.arena.allocator(), word);
+                    try self.nextToken();
+                },
                 // keywords can be used as arguments (e.g., "echo done")
                 .Done, .Fi, .Else, .Elif, .Then, .Do, .In, .For, .While, .Until, .If, .Case, .Esac, .Function => {
                     if (words.items.len > 0) {
@@ -403,6 +413,14 @@ pub const Parser = struct {
         const node = switch (token.ty) {
             .Word, .DoubleQuotedString => try self.builder.createword(token.value, token.line, token.column),
             .String => try self.builder.createstring(token.value, token.line, token.column),
+            .ProcessSubstIn => blk: {
+                const marked = try std.fmt.allocPrint(self.builder.arena.allocator(), "<({s})", .{token.value});
+                break :blk try self.builder.createword(marked, token.line, token.column);
+            },
+            .ProcessSubstOut => blk: {
+                const marked = try std.fmt.allocPrint(self.builder.arena.allocator(), ">({s})", .{token.value});
+                break :blk try self.builder.createword(marked, token.line, token.column);
+            },
             else => return error.UnexpectedToken,
         };
 
@@ -762,7 +780,7 @@ pub const Parser = struct {
 
         while (self.current_token.ty != .TestClose and self.current_token.ty != .Eof) {
             switch (self.current_token.ty) {
-                .Word, .String, .DoubleQuotedString, .ParameterExpansion, .CommandSubstitution => {
+                .Word, .String, .DoubleQuotedString, .ParameterExpansion, .CommandSubstitution, .ProcessSubstIn, .ProcessSubstOut => {
                     const word = try self.parseword();
                     try words.append(self.builder.arena.allocator(), word);
                 },

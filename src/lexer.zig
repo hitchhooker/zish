@@ -31,6 +31,10 @@ pub const TokenType = enum {
     RedirectAll,         // &>
     RedirectAllAppend,   // &>>
 
+    // process substitution
+    ProcessSubstIn,      // <(
+    ProcessSubstOut,     // >(
+
     // grouping
     LeftParen,      // (
     RightParen,     // )
@@ -210,6 +214,35 @@ pub const Lexer = struct {
         };
     }
 
+    // collect process substitution <(cmd) or >(cmd)
+    fn collectProcessSubst(self: *Self, ty: TokenType) Token {
+        _ = self.advance(); // skip opening (
+        self.use_buf = true;
+        var depth: u32 = 1;
+
+        while (depth > 0) {
+            const ch = self.peek() orelse break;
+            if (ch == '(') {
+                depth += 1;
+            } else if (ch == ')') {
+                depth -= 1;
+                if (depth == 0) {
+                    _ = self.advance(); // skip closing )
+                    break;
+                }
+            }
+            self.bufAppend(ch);
+            _ = self.advance();
+        }
+
+        return Token{
+            .ty = ty,
+            .value = self.buf[self.buf_idx][0..self.buf_len],
+            .line = self.token_line,
+            .column = self.token_col,
+        };
+    }
+
     pub fn nextToken(self: *Self) !Token {
         while (true) {
             const c = self.peek();
@@ -340,6 +373,10 @@ pub const Lexer = struct {
                         },
                         '>' => {
                             _ = self.advance();
+                            if (self.peek() == @as(u8, '(')) {
+                                // >( process substitution - collect until matching )
+                                return self.collectProcessSubst(.ProcessSubstOut);
+                            }
                             if (self.peek() == @as(u8, '>')) {
                                 _ = self.advance();
                                 return self.makeTokenValue(.RedirectAppend, ">>");
@@ -355,6 +392,10 @@ pub const Lexer = struct {
                         },
                         '<' => {
                             _ = self.advance();
+                            if (self.peek() == @as(u8, '(')) {
+                                // <( process substitution - collect until matching )
+                                return self.collectProcessSubst(.ProcessSubstIn);
+                            }
                             if (self.peek() == @as(u8, '<')) {
                                 _ = self.advance();
                                 if (self.peek() == @as(u8, '<')) {
