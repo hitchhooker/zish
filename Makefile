@@ -1,5 +1,6 @@
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
+MANDIR = $(PREFIX)/share/man/man1
 SHELL_PATH = $(BINDIR)/zish
 
 .PHONY: all build install uninstall add-shell remove-shell clean test test-verbose
@@ -11,8 +12,11 @@ build:
 
 install: build
 	install -d $(DESTDIR)$(BINDIR)
+	install -d $(DESTDIR)$(MANDIR)
 	install -m 755 zig-out/bin/zish $(DESTDIR)$(SHELL_PATH)
+	install -m 644 zish.1 $(DESTDIR)$(MANDIR)/zish.1
 	@echo "installed zish to $(SHELL_PATH)"
+	@echo "installed man page to $(MANDIR)/zish.1"
 	@echo "run 'sudo make add-shell' to add to /etc/shells"
 
 add-shell:
@@ -33,6 +37,7 @@ remove-shell:
 
 uninstall: remove-shell
 	rm -f $(DESTDIR)$(SHELL_PATH)
+	rm -f $(DESTDIR)$(MANDIR)/zish.1
 	@echo "uninstalled zish"
 
 clean:
