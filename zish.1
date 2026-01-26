@@ -1,0 +1,649 @@
+.TH ZISH 1 "January 2026" "zish 0.9.0" "User Commands"
+.SH NAME
+zish \- a modern shell with vim editing and job control
+.SH SYNOPSIS
+.B zish
+[\fB\-c\fR \fIcommand\fR]
+[\fB\-\-version\fR]
+[\fB\-\-help\fR]
+[\fIscript\fR [\fIarguments\fR...]]
+.SH DESCRIPTION
+.B zish
+is a Unix shell written in Zig, featuring vim-style line editing,
+job control, arrays, process substitution, and statistical benchmarking.
+.PP
+When invoked without arguments, zish starts an interactive session.
+When given \fB\-c\fR, it executes the command string.
+When given a script path, it executes the script.
+.SH OPTIONS
+.TP
+.BR \-c " " \fIcommand\fR
+Execute \fIcommand\fR and exit.
+.TP
+.BR \-\-version
+Print version information and exit.
+.TP
+.BR \-\-help
+Print usage information and exit.
+.SH SHELL GRAMMAR
+.SS Simple Commands
+A simple command is a sequence of words separated by spaces.
+The first word is the command name, subsequent words are arguments.
+.PP
+.RS
+.nf
+ls \-la /tmp
+echo "hello world"
+.fi
+.RE
+.SS Pipelines
+Commands can be connected with pipes:
+.PP
+.RS
+.nf
+cat file | grep pattern | wc \-l
+.fi
+.RE
+.SS Lists
+Commands can be chained:
+.PP
+.RS
+.nf
+cmd1 && cmd2      # cmd2 runs only if cmd1 succeeds
+cmd1 || cmd2      # cmd2 runs only if cmd1 fails
+cmd1 ; cmd2       # cmd2 runs regardless
+cmd &             # run cmd in background
+.fi
+.RE
+.SS Redirections
+.TP
+.B > file
+Redirect stdout to file (overwrite)
+.TP
+.B >> file
+Redirect stdout to file (append)
+.TP
+.B < file
+Redirect stdin from file
+.TP
+.B 2> file
+Redirect stderr to file
+.TP
+.B 2>&1
+Redirect stderr to stdout
+.TP
+.B &> file
+Redirect both stdout and stderr to file
+.SS Process Substitution
+.TP
+.B <(command)
+Substitute with a file descriptor containing command's output
+.TP
+.B >(command)
+Substitute with a file descriptor that feeds into command's input
+.PP
+Example:
+.RS
+.nf
+diff <(sort file1) <(sort file2)
+.fi
+.RE
+.SS Quoting
+.TP
+.B 'single quotes'
+Literal string, no expansion
+.TP
+.B "double quotes"
+Variables and command substitution expanded
+.TP
+.B $'escape sequences'
+Supports \\n, \\t, \\e, \\xHH, etc.
+.TP
+.B \\
+Escape next character
+.SS Variables
+.PP
+.RS
+.nf
+VAR=value         # assignment
+echo $VAR         # expansion
+echo ${VAR}       # braced expansion
+echo ${VAR:-def}  # default if unset
+echo ${VAR:=def}  # assign default if unset
+echo ${VAR:+alt}  # alternate if set
+echo ${VAR:?err}  # error if unset
+echo ${#VAR}      # length
+echo ${VAR#pat}   # remove shortest prefix
+echo ${VAR##pat}  # remove longest prefix
+echo ${VAR%pat}   # remove shortest suffix
+echo ${VAR%%pat}  # remove longest suffix
+.fi
+.RE
+.SS Arrays
+.PP
+.RS
+.nf
+arr=(one two three)    # declare array
+echo ${arr[0]}         # first element
+echo ${arr[@]}         # all elements
+echo ${#arr[@]}        # array length
+arr+=(four)            # append
+arr[1]=TWO             # modify element
+.fi
+.RE
+.SS Command Substitution
+.PP
+.RS
+.nf
+$(command)        # preferred form
+\`command\`         # legacy form
+.fi
+.RE
+.SS Arithmetic
+.PP
+.RS
+.nf
+$((expression))   # arithmetic expansion
+.fi
+.RE
+Supports: + \- * / % ** (power), parentheses, variables
+.SS Globbing
+.TP
+.B *
+Match any string
+.TP
+.B ?
+Match any single character
+.TP
+.B [abc]
+Match any character in set
+.TP
+.B [a-z]
+Match any character in range
+.TP
+.B [!abc]
+Match any character not in set
+.SS Control Flow
+.PP
+.RS
+.nf
+if command; then
+    commands
+elif command; then
+    commands
+else
+    commands
+fi
+
+while command; do
+    commands
+done
+
+for var in words; do
+    commands
+done
+
+case word in
+    pattern) commands ;;
+    *) default ;;
+esac
+.fi
+.RE
+.SS Functions
+.PP
+.RS
+.nf
+func() {
+    commands
+}
+
+function func {
+    commands
+}
+.fi
+.RE
+.SH BUILTINS
+.TP
+.B cd \fR[\fIdir\fR]
+Change directory. With no argument, change to $HOME.
+Supports \fBcd \-\fR to return to previous directory.
+.TP
+.B pwd
+Print working directory.
+.TP
+.B echo \fR[\fB\-n\fR] [\fB\-e\fR] [\fIargs\fR...]
+Print arguments. \fB\-n\fR omits newline, \fB\-e\fR enables escapes.
+.TP
+.B printf \fIformat\fR [\fIargs\fR...]
+Formatted output. Supports %s, %d, %x, %o, %f, %c, %b, %q and width/precision.
+.TP
+.B read \fR[\fB\-r\fR] [\fB\-p\fR \fIprompt\fR] [\fB\-t\fR \fIsec\fR] [\fB\-n\fR \fIcount\fR] [\fB\-s\fR] [\fB\-d\fR \fIdelim\fR] [\fB\-a\fR \fIarray\fR] [\fIvar\fR...]
+Read line into variables. Options:
+.RS
+.TP
+.B \-r
+Raw mode (no backslash escapes)
+.TP
+.B \-p \fIprompt\fR
+Display prompt
+.TP
+.B \-t \fIseconds\fR
+Timeout
+.TP
+.B \-n \fIcount\fR
+Read exactly N characters
+.TP
+.B \-s
+Silent (no echo)
+.TP
+.B \-d \fIdelim\fR
+Use delimiter instead of newline
+.TP
+.B \-a \fIarray\fR
+Read into array
+.RE
+.TP
+.B export \fR[\fIname\fR[=\fIvalue\fR]...]
+Export variables to environment.
+.TP
+.B unset \fIname\fR...
+Remove variables.
+.TP
+.B set \fR[\fB\-euxo\fR] [\fB\-\-\fR \fIargs\fR...]
+Set shell options or positional parameters.
+.TP
+.B shift \fR[\fIn\fR]
+Shift positional parameters left by n (default 1).
+.TP
+.B source \fIfile\fR, . \fIfile\fR
+Execute commands from file in current shell.
+.TP
+.B alias \fR[\fIname\fR[=\fIvalue\fR]...]
+Define or list aliases.
+.TP
+.B unalias \fIname\fR...
+Remove aliases.
+.TP
+.B type \fIname\fR...
+Show how names would be interpreted.
+.TP
+.B which \fIname\fR...
+Show path to executables.
+.TP
+.B history \fR[\fB\-c\fR]
+Show or clear command history.
+.TP
+.B true
+Return success (0).
+.TP
+.B false
+Return failure (1).
+.TP
+.B exit \fR[\fIn\fR]
+Exit shell with status n (default 0).
+.TP
+.B return \fR[\fIn\fR]
+Return from function with status n.
+.TP
+.B test \fIexpr\fR, [ \fIexpr\fR ]
+Evaluate conditional expression.
+.TP
+.B [[ \fIexpr\fR ]]
+Extended conditional with pattern matching and regex.
+.TP
+.B trap \fR[\fIaction\fR] [\fIsignal\fR...]
+Set signal handlers. Signals: EXIT, INT, TERM, HUP, etc.
+.TP
+.B kill \fR[\fB\-\fIsignal\fR] \fIpid\fR...
+Send signal to process. Supports %jobid.
+.TP
+.B jobs \fR[\fB\-l\fR]
+List background jobs.
+.TP
+.B fg \fR[\fI%job\fR]
+Bring job to foreground.
+.TP
+.B bg \fR[\fI%job\fR]
+Resume job in background.
+.TP
+.B wait \fR[\fIpid\fR...]
+Wait for background processes.
+.TP
+.B time \fR[\fB\-n\fR \fIiter\fR] [\fB\-w\fR \fIwarmup\fR] [\fB\-v\fR] [\fB\-q\fR] [\fB\-H\fR] \fIcommand\fR
+Time command execution with optional benchmarking.
+.RS
+.TP
+.B \-n \fIiterations\fR
+Run multiple iterations for statistical analysis
+.TP
+.B \-w \fIwarmup\fR
+Number of warmup runs (discarded)
+.TP
+.B \-v
+Verbose output (detailed resource usage)
+.TP
+.B \-q
+Quiet (suppress command output)
+.TP
+.B \-H
+Show histogram of timing distribution
+.RE
+.PP
+Default output format:
+.RS
+0.00s user 0.00s sys 2336 KB 0.101s total
+.RE
+.PP
+With \fB\-n\fR, shows statistics: mean, median, stddev, min, max, percentiles.
+.TP
+.B eval \fIarg\fR...
+Concatenate arguments and execute as command.
+.TP
+.B exec \fIcommand\fR
+Replace shell with command.
+.TP
+.B command \fIcmd\fR
+Run cmd bypassing functions and aliases.
+.TP
+.B builtin \fIcmd\fR
+Run builtin bypassing functions and aliases.
+.TP
+.B local \fIname\fR[=\fIvalue\fR]...
+Declare local variables in functions.
+.TP
+.B declare \fR[\fB\-a\fR] \fIname\fR[=\fIvalue\fR]...
+Declare variables. \fB\-a\fR declares array.
+.TP
+.B let \fIexpr\fR
+Evaluate arithmetic expression.
+.TP
+.B getopts \fIoptstring\fR \fIname\fR
+Parse positional parameters.
+.TP
+.B colon (:)
+No-op, always succeeds.
+.TP
+.B hash
+Managed command hash table (currently no-op).
+.SH SHELL OPTIONS
+Set with \fBset \-o\fR \fIoption\fR or \fBset \-\fIx\fR.
+Unset with \fBset +o\fR \fIoption\fR or \fBset +\fIx\fR.
+.TP
+.BR errexit " (" \-e ")"
+Exit immediately if a command exits with non-zero status.
+.TP
+.BR nounset " (" \-u ")"
+Treat unset variables as an error.
+.TP
+.BR xtrace " (" \-x ")"
+Print commands and arguments as they are executed.
+.TP
+.B pipefail
+Return value of pipeline is the status of the last command
+to exit with non-zero status, or zero if all succeed.
+.SH LINE EDITING
+.B zish
+uses vim-style modal editing by default.
+.SS Normal Mode
+.TP
+.BR h ", " l
+Move cursor left/right
+.TP
+.BR j ", " k
+Navigate history down/up
+.TP
+.BR w ", " b
+Move forward/backward by word
+.TP
+.BR e
+Move to end of word
+.TP
+.BR 0 ", " ^
+Move to beginning of line
+.TP
+.BR $
+Move to end of line
+.TP
+.BR i ", " a
+Enter insert mode (before/after cursor)
+.TP
+.BR I ", " A
+Enter insert mode at beginning/end of line
+.TP
+.BR x ", " X
+Delete character at/before cursor
+.TP
+.BR dw ", " db ", " dd
+Delete word forward/backward/line
+.TP
+.BR cw ", " cc
+Change word/line
+.TP
+.BR r
+Replace single character
+.TP
+.BR u
+Undo
+.TP
+.BR p ", " P
+Paste after/before cursor
+.TP
+.BR /
+Search history forward
+.TP
+.BR ?
+Search history backward
+.TP
+.BR n ", " N
+Repeat search forward/backward
+.TP
+.BR gg ", " G
+Go to first/last history entry
+.SS Insert Mode
+.TP
+.BR Escape ", " Ctrl-[
+Return to normal mode
+.TP
+.BR Ctrl-w
+Delete word backward
+.TP
+.BR Ctrl-u
+Delete to beginning of line
+.TP
+.BR Ctrl-k
+Delete to end of line
+.TP
+.BR Ctrl-a
+Move to beginning of line
+.TP
+.BR Ctrl-e
+Move to end of line
+.TP
+.BR Ctrl-r
+Reverse incremental history search
+.TP
+.BR Tab ", " Shift-Tab
+Cycle completions forward/backward
+.SS Completion
+Tab completion works for:
+.IP \(bu 2
+Commands (builtins, aliases, executables in PATH)
+.IP \(bu 2
+File and directory paths
+.IP \(bu 2
+Variables ($VAR)
+.IP \(bu 2
+Git subcommands and branches
+.PP
+Directory paths are completed with trailing slash.
+.SH JOB CONTROL
+.TP
+.BR Ctrl-z
+Suspend foreground job
+.TP
+.BR Ctrl-c
+Interrupt foreground job
+.TP
+.BR jobs
+List jobs
+.TP
+.BR fg " " %n
+Resume job n in foreground
+.TP
+.BR bg " " %n
+Resume job n in background
+.TP
+.BR kill " " %n
+Send signal to job n
+.PP
+Job specifications: %1 (job 1), %+ (current), %- (previous), %string (match).
+.SH HISTORY
+Command history is saved to \fB~/.zish_history\fR.
+.PP
+History expansion:
+.TP
+.B !!
+Previous command
+.TP
+.B !n
+Command number n
+.TP
+.B !string
+Most recent command starting with string
+.SH COMMAND SUGGESTIONS
+When a command is not found, zish suggests similar commands
+using Levenshtein distance matching against builtins, aliases,
+and common commands.
+.SH ENVIRONMENT
+.TP
+.B HOME
+Home directory for cd and tilde expansion.
+.TP
+.B PATH
+Colon-separated list of directories to search for commands.
+.TP
+.B PS1
+Primary prompt string (supports escape sequences).
+.TP
+.B OLDPWD
+Previous working directory (for cd \-).
+.TP
+.B PWD
+Current working directory.
+.TP
+.B ?
+Exit status of last command.
+.TP
+.B $
+Process ID of shell.
+.TP
+.B !
+Process ID of last background command.
+.TP
+.B #
+Number of positional parameters.
+.TP
+.B @
+All positional parameters as separate words.
+.TP
+.B *
+All positional parameters as single word.
+.TP
+.B 0
+Name of shell or script.
+.TP
+.B 1, 2, ...
+Positional parameters.
+.SH PROMPT ESCAPES
+The PS1 variable supports these escape sequences:
+.TP
+.B \\u
+Username
+.TP
+.B \\h
+Hostname (short)
+.TP
+.B \\H
+Hostname (full)
+.TP
+.B \\w
+Working directory (~ for home)
+.TP
+.B \\W
+Basename of working directory
+.TP
+.B \\$
+# if root, $ otherwise
+.TP
+.B \\n
+Newline
+.TP
+.B \\t
+Time (HH:MM:SS)
+.TP
+.B \\d
+Date
+.TP
+.B \\e
+Escape character
+.TP
+.B \\[, \\]
+Begin/end non-printing sequence
+.SH FILES
+.TP
+.B ~/.zishrc
+Startup file for interactive shells.
+.TP
+.B ~/.zish_history
+Command history file.
+.SH EXIT STATUS
+The exit status is that of the last command executed,
+or 0 if no command was executed.
+With \fB\-c\fR, the exit status is that of the command string.
+.SH EXAMPLES
+.PP
+Run a command:
+.RS
+.nf
+zish \-c 'echo hello'
+.fi
+.RE
+.PP
+Run a script:
+.RS
+.nf
+zish script.sh arg1 arg2
+.fi
+.RE
+.PP
+Benchmark a command:
+.RS
+.nf
+time \-n 100 \-w 5 \-H ./myprogram
+.fi
+.RE
+.PP
+Process substitution:
+.RS
+.nf
+paste <(cut \-f1 file1) <(cut \-f2 file2)
+.fi
+.RE
+.PP
+Array operations:
+.RS
+.nf
+files=(*.txt)
+for f in "${files[@]}"; do
+    echo "Processing $f"
+done
+.fi
+.RE
+.SH SEE ALSO
+.BR bash (1),
+.BR zsh (1),
+.BR sh (1)
+.SH BUGS
+Report bugs at https://github.com/user/zish/issues
+.SH AUTHOR
+Written in Zig.
