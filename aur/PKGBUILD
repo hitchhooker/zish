@@ -4,11 +4,11 @@ pkgver=0.10.0
 pkgrel=1
 pkgdesc="fast shell interpreter written in zig"
 arch=('x86_64')
-url="https://github.com/hitchhooker/zish"
+url="https://github.com/rotkonetworks/zish"
 license=('MIT')
 depends=('glibc')
 makedepends=('zig>=0.15.1')
-source=("$pkgname-$pkgver.tar.gz::https://github.com/hitchhooker/$pkgname/archive/v$pkgver.tar.gz")
+source=("$pkgname-$pkgver.tar.gz::https://github.com/rotkonetworks/$pkgname/archive/v$pkgver.tar.gz")
 sha256sums=('a3a228bc7c9ce87c3a915a84d31bd8a87b62479f04e5f5feeb5822c728ffc441')
 
 build() {
